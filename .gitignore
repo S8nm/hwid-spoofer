@@ -1,0 +1,34 @@
+# Build output
+build/
+Debug/
+Release/
+x64/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Binaries
+*.exe
+*.sys
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+
+# Temp
+*.tmp
+*.bak
+
+# Allow embedded drivers
+!manager/drivers/*.sys
