@@ -1,0 +1,636 @@
+/*
+ * System component - hardware abstraction layer
+ */
+
+#include <ntddk.h>
+#include <ntddstor.h>
+#include <ntstrsafe.h>
+
+extern POBJECT_TYPE *IoDriverObjectType;
+extern NTSTATUS NTAPI ObReferenceObjectByName(
+    PUNICODE_STRING ObjectName, ULONG Attributes, PACCESS_STATE AccessState,
+    ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode,
+    PVOID ParseContext, PVOID *Object);
+
+// ==================== CONSTANTS (obfuscated at compile) ====================
+
+#define IO_SMART         0x7C088
+#define IO_ATA           0x4D02C
+#define IO_ATA_D         0x4D030
+#define IO_NVME_CMD      0x2D5140
+#define ID_ATA_IDENT     0xEC
+
+// ==================== STRUCTURES ====================
+
+typedef struct _IH {
+    PVOID Orig;
+    PVOID Det;
+    UCHAR SavedBytes[14];
+    UCHAR PatchBytes[14];
+    BOOLEAN Active;
+    KSPIN_LOCK Lock;
+} IH, *PIH;
+
+typedef struct _ATA_PT {
+    USHORT Length;
+    USHORT AtaFlags;
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR Rsv1;
+    ULONG DataLen;
+    ULONG Timeout;
+    ULONG Rsv2;
+    ULONG_PTR DataOff;
+    UCHAR PrevTF[8];
+    UCHAR CurTF[8];
+} ATA_PT, *PATA_PT;
+
+typedef struct _IDENT_DATA {
+    UCHAR Pad0[20];
+    CHAR Serial[20];
+    UCHAR Pad1[6];
+    CHAR FwRev[8];
+    CHAR Model[40];
+    UCHAR Rest[424];
+} IDENT_DATA;
+
+typedef struct _SMBIOS_HDR {
+    UCHAR Type;
+    UCHAR Length;
+    USHORT Handle;
+} SMBIOS_HDR;
+
+typedef struct _SMBIOS_RAW {
+    UCHAR Method;
+    UCHAR MajVer;
+    UCHAR MinVer;
+    UCHAR DmiRev;
+    ULONG Length;
+    UCHAR Data[1];
+} SMBIOS_RAW;
+
+typedef struct _FS_VOL_INFO {
+    LARGE_INTEGER CreateTime;
+    ULONG SerialNumber;
+    ULONG LabelLen;
+    BOOLEAN SupObj;
+    WCHAR Label[1];
+} FS_VOL_INFO;
+
+#pragma pack(push, 1)
+typedef struct _IDLOG {
+    CHAR Sig[8];
+    CHAR ODs[64]; CHAR FDs[64];
+    CHAR OBs[64]; CHAR FBs[64];
+    CHAR OMs[64]; CHAR FMs[64];
+    CHAR OUu[48]; CHAR FUu[48];
+    UCHAR OMc[6]; UCHAR FMc[6];
+    ULONG OVs;    ULONG FVs;
+    CHAR OGp[64]; CHAR FGp[64];
+    CHAR OMn[48]; CHAR FMn[48];
+    CHAR OFr[16]; CHAR FFr[16];
+} IDLOG;
+#pragma pack(pop)
+
+typedef NTSTATUS (*FnDispatch)(PDEVICE_OBJECT, PIRP);
+
+// ==================== GLOBALS ====================
+
+extern POBJECT_TYPE *IoDriverObjectType;
+
+static CHAR g_DS[64]  = {0};  // disk serial
+static CHAR g_MN[48]  = {0};  // model number
+static CHAR g_FR[16]  = {0};  // firmware rev
+static CHAR g_BS[64]  = {0};  // BIOS serial
+static CHAR g_MB[64]  = {0};  // board serial
+static UCHAR g_UU[16] = {0};  // UUID
+static UCHAR g_MC[6]  = {0};  // MAC
+static ULONG g_VS     = 0;    // volume serial
+static CHAR g_GP[64]  = {0};  // GPU id
+
+static IH g_hDisk  = {0};
+static IH g_hNdis  = {0};
+static IH g_hFs    = {0};
+
+static IDLOG g_Log  = {0};
+static BOOLEAN g_Logged = FALSE;
+
+// ==================== PROTOTYPES ====================
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT, PUNICODE_STRING);
+
+// ==================== MDL-BASED SAFE WRITE ====================
+
+static BOOLEAN SafeWrite(PVOID dst, PVOID src, SIZE_T sz) {
+    PMDL mdl = IoAllocateMdl(dst, (ULONG)sz, FALSE, FALSE, NULL);
+    if (!mdl) return FALSE;
+
+    __try {
+        MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        IoFreeMdl(mdl);
+        return FALSE;
+    }
+
+    PVOID mapped = MmMapLockedPagesSpecifyCache(
+        mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+    if (!mapped) {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+        return FALSE;
+    }
+
+    NTSTATUS st = MmProtectMdlSystemAddress(mdl, PAGE_READWRITE);
+    if (NT_SUCCESS(st)) {
+        RtlCopyMemory(mapped, src, sz);
+    }
+
+    MmUnmapLockedPages(mapped, mdl);
+    MmUnlockPages(mdl);
+    IoFreeMdl(mdl);
+    return NT_SUCCESS(st);
+}
+
+// ==================== INLINE HOOK ENGINE (SPINLOCK PROTECTED) ====================
+
+static BOOLEAN HookInstall(PVOID target, PVOID detour, PIH h) {
+    if (!target || !detour || !h) return FALSE;
+
+    KeInitializeSpinLock(&h->Lock);
+    RtlCopyMemory(h->SavedBytes, target, 14);
+
+    h->PatchBytes[0] = 0x48;
+    h->PatchBytes[1] = 0xB8;
+    *(PVOID*)&h->PatchBytes[2] = detour;
+    h->PatchBytes[10] = 0xFF;
+    h->PatchBytes[11] = 0xE0;
+    h->PatchBytes[12] = 0x90;
+    h->PatchBytes[13] = 0x90;
+
+    h->Orig = target;
+    h->Det = detour;
+
+    if (!SafeWrite(target, h->PatchBytes, 14))
+        return FALSE;
+
+    h->Active = TRUE;
+    return TRUE;
+}
+
+static VOID HookRemove(PIH h) {
+    if (!h || !h->Active) return;
+    SafeWrite(h->Orig, h->SavedBytes, 14);
+    h->Active = FALSE;
+}
+
+static NTSTATUS CallOrig(PIH h, PDEVICE_OBJECT dev, PIRP irp, PVOID detour) {
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&h->Lock, &oldIrql);
+    SafeWrite(h->Orig, h->SavedBytes, 14);
+    KeReleaseSpinLock(&h->Lock, oldIrql);
+
+    FnDispatch fn = (FnDispatch)h->Orig;
+    NTSTATUS status = fn(dev, irp);
+
+    KeAcquireSpinLock(&h->Lock, &oldIrql);
+    SafeWrite(h->Orig, h->PatchBytes, 14);
+    KeReleaseSpinLock(&h->Lock, oldIrql);
+
+    return status;
+}
+
+// ==================== FIND DRIVER DISPATCH ====================
+
+static VOID DecodeStr(WCHAR* out, const UCHAR* enc, SIZE_T len, UCHAR key) {
+    for (SIZE_T i = 0; i < len; i++)
+        out[i] = (WCHAR)(enc[i] ^ key);
+    out[len] = 0;
+}
+
+static PVOID FindDispatch(PCWSTR name, ULONG mj) {
+    UNICODE_STRING uName;
+    PDRIVER_OBJECT dObj = NULL;
+    RtlInitUnicodeString(&uName, name);
+    NTSTATUS st = ObReferenceObjectByName(
+        &uName, OBJ_CASE_INSENSITIVE, NULL, 0,
+        *IoDriverObjectType, KernelMode, NULL, (PVOID*)&dObj);
+    if (!NT_SUCCESS(st)) return NULL;
+    PVOID fn = (mj <= IRP_MJ_MAXIMUM_FUNCTION) ? dObj->MajorFunction[mj] : NULL;
+    ObDereferenceObject(dObj);
+    return fn;
+}
+
+// ==================== RANDOM GENERATION ====================
+
+static ULONG g_Rng;
+
+static ULONG Rng() {
+    g_Rng = g_Rng * 1103515245 + 12345;
+    return (g_Rng >> 16) & 0x7FFF;
+}
+
+static VOID RandSerial(CHAR* buf, SIZE_T len) {
+    static const CHAR c[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (SIZE_T i = 0; i < len - 1; i++) buf[i] = c[Rng() % 35];
+    buf[len - 1] = '\0';
+}
+
+static VOID RandHex(CHAR* buf, SIZE_T len) {
+    static const CHAR h[] = "0123456789ABCDEF";
+    for (SIZE_T i = 0; i < len - 1; i++) buf[i] = h[Rng() % 16];
+    buf[len - 1] = '\0';
+}
+
+static VOID SwapBytes(CHAR* s, SIZE_T len) {
+    for (SIZE_T i = 0; i + 1 < len; i += 2) {
+        CHAR t = s[i]; s[i] = s[i+1]; s[i+1] = t;
+    }
+}
+
+static VOID ByteToHex(UCHAR b, CHAR* out) {
+    static const CHAR h[] = "0123456789ABCDEF";
+    out[0] = h[(b >> 4) & 0xF];
+    out[1] = h[b & 0xF];
+}
+
+static VOID FormatUUID(CHAR* dst, SIZE_T dstSz, const UCHAR* uuid) {
+    CHAR buf[48];
+    int p = 0;
+    for (int i = 0; i < 16; i++) {
+        ByteToHex(uuid[i], &buf[p]); p += 2;
+        if (i == 3 || i == 5 || i == 7 || i == 9) buf[p++] = '-';
+    }
+    buf[p] = '\0';
+    RtlStringCbCopyA(dst, dstSz, buf);
+}
+
+static VOID GenAllIDs() {
+    LARGE_INTEGER perf, perf2;
+    perf = KeQueryPerformanceCounter(NULL);
+    perf2 = KeQueryPerformanceCounter(NULL);
+    g_Rng = perf.LowPart ^ perf2.HighPart ^ 0x5A3C1E7D;
+
+    RtlStringCbCopyA(g_DS, sizeof(g_DS), "WD-WMAZA");
+    RandHex(g_DS + 8, 9);
+
+    RtlStringCbCopyA(g_MN, sizeof(g_MN), "WDC WD10EZEX-");
+    RandHex(g_MN + 14, 9);
+
+    RandHex(g_FR, 9);
+
+    RtlStringCbCopyA(g_BS, sizeof(g_BS), "BIOS-");
+    RandSerial(g_BS + 5, 13);
+
+    RtlStringCbCopyA(g_MB, sizeof(g_MB), "BS-");
+    RandSerial(g_MB + 3, 13);
+
+    for (int i = 0; i < 16; i++) g_UU[i] = (UCHAR)(Rng() & 0xFF);
+
+    g_MC[0] = 0x02;
+    for (int i = 1; i < 6; i++) g_MC[i] = (UCHAR)(Rng() & 0xFF);
+
+    g_VS = perf.LowPart ^ perf2.HighPart ^ 0xABCD1234;
+
+    // GPU adapter string NOT spoofed - model name is shared by millions
+    // and a fake string like "GPU-7A3F21D8" is an instant red flag
+    g_GP[0] = '\0';
+}
+
+// ==================== LOG ====================
+
+static VOID WriteLog() {
+    RtlCopyMemory(g_Log.Sig, "HWIDLOG", 8);
+    RtlCopyMemory(g_Log.FDs, g_DS, 64);
+    RtlCopyMemory(g_Log.FBs, g_BS, 64);
+    RtlCopyMemory(g_Log.FMs, g_MB, 64);
+    RtlCopyMemory(g_Log.FMc, g_MC, 6);
+    g_Log.FVs = g_VS;
+    RtlCopyMemory(g_Log.FGp, g_GP, 64);
+    RtlCopyMemory(g_Log.FMn, g_MN, 48);
+    RtlCopyMemory(g_Log.FFr, g_FR, 16);
+
+    FormatUUID(g_Log.FUu, 48, g_UU);
+
+    UNICODE_STRING fp;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK io;
+    HANDLE hf;
+
+    RtlInitUnicodeString(&fp, L"\\??\\C:\\ProgramData\\hwid_log.bin");
+    InitializeObjectAttributes(&oa, &fp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    if (NT_SUCCESS(ZwCreateFile(&hf, GENERIC_WRITE | SYNCHRONIZE, &oa, &io,
+            NULL, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, 0, FILE_OVERWRITE_IF,
+            FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0))) {
+        ZwWriteFile(hf, NULL, NULL, NULL, &io, &g_Log, sizeof(IDLOG), NULL, NULL);
+        ZwClose(hf);
+    }
+    g_Logged = TRUE;
+}
+
+// ==================== SMBIOS SPOOFING ====================
+
+static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
+    if (length < sizeof(SMBIOS_RAW)) return;
+    SMBIOS_RAW* raw = (SMBIOS_RAW*)buffer;
+    PUCHAR data = raw->Data;
+    PUCHAR end = data + raw->Length;
+
+    while (data < end) {
+        SMBIOS_HDR* hdr = (SMBIOS_HDR*)data;
+        if (data + hdr->Length > end) break;
+        PUCHAR strings = data + hdr->Length;
+        if (strings >= end) break;
+
+        // Type 0: BIOS
+        if (hdr->Type == 0 && hdr->Length >= 0x12) {
+            UCHAR idx = data[0x05];
+            UCHAR num = 1;
+            PUCHAR sp = strings;
+            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = strlen((char*)sp);
+                if (sl > 0 && num == idx) {
+                    if (!g_Logged) RtlCopyMemory(g_Log.OBs, sp, min(sl, 63));
+                    RtlZeroMemory(sp, sl);
+                    RtlCopyMemory(sp, g_BS, min(strlen(g_BS), sl));
+                }
+                sp += sl + 1; num++;
+            }
+        }
+
+        // Type 1: System (UUID + serial)
+        if (hdr->Type == 1 && hdr->Length >= 0x19) {
+            if (data + 0x08 + 16 <= end) {
+                if (!g_Logged)
+                    FormatUUID(g_Log.OUu, 48, &data[8]);
+                RtlCopyMemory(data + 0x08, g_UU, 16);
+            }
+            UCHAR idx = data[0x07];
+            UCHAR num = 1;
+            PUCHAR sp = strings;
+            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = strlen((char*)sp);
+                if (sl > 0 && num == idx) {
+                    RtlZeroMemory(sp, sl);
+                    RtlCopyMemory(sp, g_BS, min(strlen(g_BS), sl));
+                }
+                sp += sl + 1; num++;
+            }
+        }
+
+        // Type 2: Baseboard
+        if (hdr->Type == 2 && hdr->Length >= 0x08) {
+            UCHAR idx = data[0x07];
+            UCHAR num = 1;
+            PUCHAR sp = strings;
+            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = strlen((char*)sp);
+                if (sl > 0 && num == idx) {
+                    if (!g_Logged) RtlCopyMemory(g_Log.OMs, sp, min(sl, 63));
+                    RtlZeroMemory(sp, sl);
+                    RtlCopyMemory(sp, g_MB, min(strlen(g_MB), sl));
+                }
+                sp += sl + 1; num++;
+            }
+        }
+
+        // Type 3: Chassis
+        if (hdr->Type == 3 && hdr->Length >= 0x09) {
+            UCHAR idx = data[0x07];
+            UCHAR num = 1;
+            PUCHAR sp = strings;
+            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = strlen((char*)sp);
+                if (sl > 0 && num == idx) {
+                    RtlZeroMemory(sp, sl);
+                    RtlCopyMemory(sp, g_MB, min(strlen(g_MB), sl));
+                }
+                sp += sl + 1; num++;
+            }
+        }
+
+        PUCHAR next = strings;
+        while (next < end - 1 && !(next[0] == 0 && next[1] == 0)) next++;
+        data = next + 2;
+    }
+}
+
+// ==================== DISK HOOK ====================
+
+NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp);
+
+static VOID SpoofStorageQP(PVOID buf, ULONG_PTR len) {
+    PSTORAGE_DEVICE_DESCRIPTOR d = (PSTORAGE_DEVICE_DESCRIPTOR)buf;
+
+    if (d->SerialNumberOffset > 0 && d->SerialNumberOffset < len) {
+        PCHAR s = (PCHAR)((PUCHAR)d + d->SerialNumberOffset);
+        SIZE_T ml = len - d->SerialNumberOffset;
+        if (!g_Logged) RtlCopyMemory(g_Log.ODs, s, min(strlen(s), 63));
+        if (ml > strlen(g_DS)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_DS, strlen(g_DS)); }
+    }
+    if (d->ProductIdOffset > 0 && d->ProductIdOffset < len) {
+        PCHAR s = (PCHAR)((PUCHAR)d + d->ProductIdOffset);
+        SIZE_T ml = len - d->ProductIdOffset;
+        if (!g_Logged) RtlCopyMemory(g_Log.OMn, s, min(strlen(s), 47));
+        if (ml > strlen(g_MN)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_MN, strlen(g_MN)); }
+    }
+    if (d->ProductRevisionOffset > 0 && d->ProductRevisionOffset < len) {
+        PCHAR s = (PCHAR)((PUCHAR)d + d->ProductRevisionOffset);
+        SIZE_T ml = len - d->ProductRevisionOffset;
+        if (!g_Logged) RtlCopyMemory(g_Log.OFr, s, min(strlen(s), 15));
+        if (ml > strlen(g_FR)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_FR, strlen(g_FR)); }
+    }
+}
+
+static VOID SpoofATA(PVOID buf, ULONG len) {
+    if (len < 512) return;
+    IDENT_DATA* id = (IDENT_DATA*)buf;
+    CHAR fs[20], fm[40], ff[8];
+    RtlZeroMemory(fs, 20); RtlZeroMemory(fm, 40); RtlZeroMemory(ff, 8);
+
+    SIZE_T sl = min(strlen(g_DS), 20);
+    RtlCopyMemory(fs, g_DS, sl);
+    for (SIZE_T i = sl; i < 20; i++) fs[i] = ' ';
+
+    SIZE_T ml = min(strlen(g_MN), 40);
+    RtlCopyMemory(fm, g_MN, ml);
+    for (SIZE_T i = ml; i < 40; i++) fm[i] = ' ';
+
+    SIZE_T fl = min(strlen(g_FR), 8);
+    RtlCopyMemory(ff, g_FR, fl);
+    for (SIZE_T i = fl; i < 8; i++) ff[i] = ' ';
+
+    SwapBytes(fs, 20); SwapBytes(fm, 40); SwapBytes(ff, 8);
+    RtlCopyMemory(id->Serial, fs, 20);
+    RtlCopyMemory(id->Model, fm, 40);
+    RtlCopyMemory(id->FwRev, ff, 8);
+}
+
+static VOID SpoofSMART(PVOID buf, ULONG len) {
+    if (len > 24 + 512) SpoofATA((PUCHAR)buf + 24, 512);
+}
+
+NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    ULONG code = sp->Parameters.DeviceIoControl.IoControlCode;
+
+    if (code == IOCTL_STORAGE_QUERY_PROPERTY) {
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        if (NT_SUCCESS(st) && irp->IoStatus.Information > sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+            PVOID b = irp->AssociatedIrp.SystemBuffer;
+            if (b) {
+                PSTORAGE_PROPERTY_QUERY q = (PSTORAGE_PROPERTY_QUERY)b;
+                if (q->PropertyId == StorageDeviceProperty)
+                    SpoofStorageQP(b, irp->IoStatus.Information);
+            }
+        }
+        return st;
+    }
+    if (code == IO_SMART) {
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer)
+            SpoofSMART(irp->AssociatedIrp.SystemBuffer, (ULONG)irp->IoStatus.Information);
+        return st;
+    }
+    if (code == IO_ATA || code == IO_ATA_D) {
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer) {
+            PATA_PT a = (PATA_PT)irp->AssociatedIrp.SystemBuffer;
+            if (a->CurTF[6] == ID_ATA_IDENT && a->DataLen >= 512)
+                SpoofATA((PUCHAR)a + a->DataOff, a->DataLen);
+        }
+        return st;
+    }
+    if (code == IO_NVME_CMD) {
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        if (NT_SUCCESS(st) && irp->IoStatus.Information > 64 && irp->AssociatedIrp.SystemBuffer) {
+            PUCHAR d = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
+            SIZE_T sl = min(strlen(g_DS), 20);
+            if (irp->IoStatus.Information > 64) {
+                RtlZeroMemory(d + 44, 20);
+                RtlCopyMemory(d + 44, g_DS, sl);
+            }
+        }
+        return st;
+    }
+    return CallOrig(&g_hDisk, dev, irp, HkDisk);
+}
+
+// ==================== NDIS HOOK ====================
+
+NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp);
+
+NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+
+    if (sp->MajorFunction == IRP_MJ_INTERNAL_DEVICE_CONTROL ||
+        sp->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
+        NTSTATUS st = CallOrig(&g_hNdis, dev, irp, HkNdis);
+        if (NT_SUCCESS(st) && irp->IoStatus.Information >= 6) {
+            PUCHAR mac = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
+            if (mac) {
+                BOOLEAN ok = FALSE;
+                for (int i = 0; i < 6; i++) { if (mac[i] != 0 && mac[i] != 0xFF) { ok = TRUE; break; } }
+                if (ok) {
+                    if (!g_Logged) RtlCopyMemory(g_Log.OMc, mac, 6);
+                    RtlCopyMemory(mac, g_MC, 6);
+                }
+            }
+        }
+        return st;
+    }
+    return CallOrig(&g_hNdis, dev, irp, HkNdis);
+}
+
+// ==================== FS HOOK (VOLUME SERIAL) ====================
+
+NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp);
+
+NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    NTSTATUS st = CallOrig(&g_hFs, dev, irp, HkFs);
+
+    if (NT_SUCCESS(st) &&
+        sp->Parameters.QueryVolume.FsInformationClass == 1 &&
+        irp->IoStatus.Information >= sizeof(FS_VOL_INFO)) {
+        FS_VOL_INFO* vi = (FS_VOL_INFO*)irp->AssociatedIrp.SystemBuffer;
+        if (vi) {
+            if (!g_Logged) g_Log.OVs = vi->SerialNumber;
+            vi->SerialNumber = g_VS;
+        }
+    }
+    return st;
+}
+
+// ==================== REGISTRY SPOOFING ====================
+
+static VOID RegSetStr(HANDLE hk, PCWSTR name, PCHAR val) {
+    UNICODE_STRING vn; ANSI_STRING av; UNICODE_STRING uv;
+    RtlInitUnicodeString(&vn, name);
+    RtlInitAnsiString(&av, val);
+    if (NT_SUCCESS(RtlAnsiStringToUnicodeString(&uv, &av, TRUE))) {
+        ZwSetValueKey(hk, &vn, 0, REG_SZ, uv.Buffer, uv.Length + sizeof(WCHAR));
+        RtlFreeUnicodeString(&uv);
+    }
+}
+
+static VOID SpoofRegistry() {
+    UNICODE_STRING kp; OBJECT_ATTRIBUTES oa; HANDLE hk; NTSTATUS st;
+
+    RtlInitUnicodeString(&kp, L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\BIOS");
+    InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
+    if (NT_SUCCESS(st)) {
+        RegSetStr(hk, L"SystemSerialNumber", g_BS);
+        RegSetStr(hk, L"BaseBoardSerialNumber", g_MB);
+        RegSetStr(hk, L"BIOSVersion", g_FR);
+        RegSetStr(hk, L"SystemProductName", g_MN);
+        ZwClose(hk);
+    }
+
+    RtlInitUnicodeString(&kp,
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000");
+    InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
+    if (NT_SUCCESS(st)) {
+        // GPU adapter string intentionally NOT spoofed
+        // Fake GPU names are a detection vector, real model is not unique
+        ZwClose(hk);
+    }
+}
+
+// ==================== ENTRY ====================
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    UNREFERENCED_PARAMETER(RegistryPath);
+    UNREFERENCED_PARAMETER(DriverObject);
+
+    GenAllIDs();
+
+    // Hook disk driver (covers StorageQuery, SMART, ATA, NVMe)
+    PVOID fn = NULL;
+    const WCHAR* drvs[] = { L"\\Driver\\disk", L"\\Driver\\storahci", L"\\Driver\\stornvme" };
+    for (int i = 0; i < 3; i++) {
+        fn = FindDispatch(drvs[i], IRP_MJ_DEVICE_CONTROL);
+        if (fn) break;
+    }
+    if (fn) HookInstall(fn, HkDisk, &g_hDisk);
+
+    // Hook NDIS for MAC
+    fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_DEVICE_CONTROL);
+    if (!fn) fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_INTERNAL_DEVICE_CONTROL);
+    if (fn) HookInstall(fn, HkNdis, &g_hNdis);
+
+    // Hook NTFS for volume serial
+    fn = FindDispatch(L"\\FileSystem\\Ntfs", IRP_MJ_QUERY_VOLUME_INFORMATION);
+    if (fn) HookInstall(fn, HkFs, &g_hFs);
+
+    // Direct registry spoofing
+    SpoofRegistry();
+
+    // Write log
+    WriteLog();
+
+    return STATUS_SUCCESS;
+}
