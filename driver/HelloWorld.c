@@ -192,7 +192,7 @@ static BOOLEAN HookInstall(PVOID target, PVOID detour, PIH h) {
     h->Orig = target;
     h->Det = detour;
 
-    PVOID tramp = ExAllocatePoolWithTag(NonPagedPool, 32, 'prmT');
+    PVOID tramp = ExAllocatePoolWithTag(NonPagedPoolExecute, 32, 'prmT');
     if (!tramp) return FALSE;
 
     RtlCopyMemory(tramp, h->SavedBytes, 14);
