@@ -807,28 +807,87 @@ BOOL GetMACAddress(UCHAR* mac) {
     return found;
 }
 
+static BOOL GetSMBIOSString(BYTE smbType, BYTE strOffset, char* buffer, size_t bufferSize) {
+    typedef struct {
+        BYTE  Method; BYTE MajVer; BYTE MinVer; BYTE DmiRev; DWORD Length;
+    } SMB_HDR;
+
+    DWORD fwSize = GetSystemFirmwareTable('RSMB', 0, NULL, 0);
+    if (fwSize == 0) return FALSE;
+
+    BYTE* data = (BYTE*)malloc(fwSize);
+    if (!data) return FALSE;
+
+    if (GetSystemFirmwareTable('RSMB', 0, data, fwSize) != fwSize) {
+        free(data);
+        return FALSE;
+    }
+
+    SMB_HDR* hdr = (SMB_HDR*)data;
+    BYTE* tbl = data + sizeof(SMB_HDR);
+    BYTE* tblEnd = tbl + hdr->Length;
+    BYTE* ptr = tbl;
+    BOOL found = FALSE;
+
+    while (ptr + 4 < tblEnd) {
+        BYTE type = ptr[0];
+        BYTE length = ptr[1];
+        if (length < 4) break;
+
+        if (type == smbType && length > strOffset) {
+            BYTE strIdx = ptr[strOffset];
+            if (strIdx > 0) {
+                BYTE* strings = ptr + length;
+                BYTE num = 1;
+                while (strings < tblEnd - 1 && !(strings[0] == 0 && strings[1] == 0)) {
+                    size_t sl = strlen((char*)strings);
+                    if (num == strIdx && sl > 0) {
+                        strncpy_s(buffer, bufferSize, (char*)strings, _TRUNCATE);
+                        found = TRUE;
+                        break;
+                    }
+                    strings += sl + 1;
+                    num++;
+                }
+            }
+            break;
+        }
+
+        ptr += length;
+        while (ptr < tblEnd - 1 && !(ptr[0] == 0 && ptr[1] == 0)) ptr++;
+        ptr += 2;
+    }
+
+    free(data);
+    return found;
+}
+
 BOOL GetBIOSSerial(char* buffer, size_t bufferSize) {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-            "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
-        return FALSE;
-    DWORD size = (DWORD)bufferSize;
-    DWORD type = 0;
-    LSTATUS res = RegQueryValueExA(hKey, "SystemSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
-    RegCloseKey(hKey);
-    return (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0');
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD size = (DWORD)bufferSize;
+        DWORD type = 0;
+        LSTATUS res = RegQueryValueExA(hKey, "SystemSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
+        RegCloseKey(hKey);
+        if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0')
+            return TRUE;
+    }
+    return GetSMBIOSString(1, 0x07, buffer, bufferSize);
 }
 
 BOOL GetBoardSerial(char* buffer, size_t bufferSize) {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
-            "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
-        return FALSE;
-    DWORD size = (DWORD)bufferSize;
-    DWORD type = 0;
-    LSTATUS res = RegQueryValueExA(hKey, "BaseBoardSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
-    RegCloseKey(hKey);
-    return (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0');
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD size = (DWORD)bufferSize;
+        DWORD type = 0;
+        LSTATUS res = RegQueryValueExA(hKey, "BaseBoardSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
+        RegCloseKey(hKey);
+        if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0')
+            return TRUE;
+    }
+    return GetSMBIOSString(2, 0x07, buffer, bufferSize);
 }
 
 BOOL GetSystemUUID(char* buffer, size_t bufferSize) {
