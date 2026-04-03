@@ -16,6 +16,7 @@ NTSYSCALLAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     ULONG SystemInformationClass, PVOID SystemInformation,
     ULONG SystemInformationLength, PULONG ReturnLength);
 
+
 // ==================== CONSTANTS ====================
 
 #define IO_SMART         0x7C088
@@ -84,10 +85,10 @@ typedef struct _FS_VOL_INFO {
 } FS_VOL_INFO;
 
 typedef struct _FW_TABLE_INFO {
+    ULONG ProviderSignature;
     ULONG Action;
-    ULONG DataLength;
-    ULONG TableProvSig;
-    ULONG TableId;
+    ULONG TableID;
+    ULONG TableBufferLength;
     UCHAR TableBuffer[1];
 } FW_TABLE_INFO;
 
@@ -110,8 +111,6 @@ typedef NTSTATUS (*FnDispatch)(PDEVICE_OBJECT, PIRP);
 typedef NTSTATUS (NTAPI *FnNtQuerySysInfo)(ULONG, PVOID, ULONG, PULONG);
 
 // ==================== GLOBALS ====================
-
-extern POBJECT_TYPE *IoDriverObjectType;
 
 static CHAR g_DS[64]  = {0};
 static CHAR g_MN[48]  = {0};
@@ -250,7 +249,7 @@ static ULONG Rng() {
 
 static VOID RandSerial(CHAR* buf, SIZE_T len) {
     static const CHAR c[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    for (SIZE_T i = 0; i < len - 1; i++) buf[i] = c[Rng() % 35];
+    for (SIZE_T i = 0; i < len - 1; i++) buf[i] = c[Rng() % 36];
     buf[len - 1] = '\0';
 }
 
@@ -380,9 +379,8 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
                 SIZE_T sl = strlen((char*)sp);
                 if (sl > 0 && num == idx) {
-                    if (!g_Logged) RtlCopyMemory(g_Log.OBs, sp, min(sl, 63));
                     RtlZeroMemory(sp, sl);
-                    RtlCopyMemory(sp, g_BS, min(strlen(g_BS), sl));
+                    RtlCopyMemory(sp, g_FR, min(strlen(g_FR), sl));
                 }
                 sp += sl + 1; num++;
             }
@@ -533,10 +531,8 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 64 && irp->AssociatedIrp.SystemBuffer) {
             PUCHAR d = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
             SIZE_T slen = min(strlen(g_DS), 20);
-            if (irp->IoStatus.Information > 64) {
-                RtlZeroMemory(d + 44, 20);
-                RtlCopyMemory(d + 44, g_DS, slen);
-            }
+            RtlZeroMemory(d + 44, 20);
+            RtlCopyMemory(d + 44, g_DS, slen);
         }
         return st;
     }
@@ -598,9 +594,9 @@ NTSTATUS NTAPI HkNtQuerySysInfo(ULONG Class, PVOID Info, ULONG Length, PULONG Re
     if (NT_SUCCESS(st) && Class == 76 && Info && g_SpoofedSMBIOS) {
         __try {
             FW_TABLE_INFO* fi = (FW_TABLE_INFO*)Info;
-            if (fi->Action == 1 && fi->TableProvSig == 'RSMB' && fi->DataLength > 0) {
-                ULONG copyLen = fi->DataLength < g_SpoofedSMBIOSLen
-                    ? fi->DataLength : g_SpoofedSMBIOSLen;
+            if (fi->ProviderSignature == 'RSMB' && fi->Action == 1 && fi->TableBufferLength > 0) {
+                ULONG copyLen = fi->TableBufferLength < g_SpoofedSMBIOSLen
+                    ? fi->TableBufferLength : g_SpoofedSMBIOSLen;
                 RtlCopyMemory(fi->TableBuffer, g_SpoofedSMBIOS, copyLen);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
@@ -680,6 +676,19 @@ static VOID SpoofRegistry() {
 
 // ==================== MAC REGISTRY SPOOFING ====================
 
+static VOID BuildNICKeyPath(WCHAR* out, int idx) {
+    static const WCHAR base[] =
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+        L"{4d36e972-e325-11ce-bfc1-08002be10318}\\";
+    SIZE_T len = sizeof(base) / sizeof(WCHAR) - 1;
+    RtlCopyMemory(out, base, len * sizeof(WCHAR));
+    out[len]     = L'0';
+    out[len + 1] = L'0';
+    out[len + 2] = (WCHAR)(L'0' + (idx / 10));
+    out[len + 3] = (WCHAR)(L'0' + (idx % 10));
+    out[len + 4] = L'\0';
+}
+
 static VOID SpoofMACRegistry() {
     static const CHAR hex[] = "0123456789ABCDEF";
     CHAR macStr[13];
@@ -695,9 +704,7 @@ static VOID SpoofMACRegistry() {
     HANDLE hk;
 
     for (int i = 0; i < 20; i++) {
-        RtlStringCbPrintfW(keyPath, sizeof(keyPath),
-            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-            L"{4d36e972-e325-11ce-bfc1-08002be10318}\\%04d", i);
+        BuildNICKeyPath(keyPath, i);
         RtlInitUnicodeString(&kp, keyPath);
         InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
         if (NT_SUCCESS(ZwOpenKey(&hk, KEY_SET_VALUE, &oa))) {
@@ -742,9 +749,7 @@ static VOID RevertMACRegistry() {
     RtlInitUnicodeString(&vn, L"NetworkAddress");
 
     for (int i = 0; i < 20; i++) {
-        RtlStringCbPrintfW(keyPath, sizeof(keyPath),
-            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
-            L"{4d36e972-e325-11ce-bfc1-08002be10318}\\%04d", i);
+        BuildNICKeyPath(keyPath, i);
         RtlInitUnicodeString(&kp, keyPath);
         InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
         if (NT_SUCCESS(ZwOpenKey(&hk, KEY_SET_VALUE, &oa))) {
@@ -797,24 +802,24 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     {
         ULONG needed = 0;
         FW_TABLE_INFO probe = {0};
+        probe.ProviderSignature = 'RSMB';
         probe.Action = 1;
-        probe.TableProvSig = 'RSMB';
         ZwQuerySystemInformation(76, &probe, sizeof(probe), &needed);
         if (needed > 0) {
             FW_TABLE_INFO* fi =
                 (FW_TABLE_INFO*)ExAllocatePoolWithTag(NonPagedPool, needed, 'bmsR');
             if (fi) {
                 RtlZeroMemory(fi, needed);
+                fi->ProviderSignature = 'RSMB';
                 fi->Action = 1;
-                fi->TableProvSig = 'RSMB';
                 NTSTATUS st = ZwQuerySystemInformation(76, fi, needed, &needed);
-                if (NT_SUCCESS(st) && fi->DataLength > 0) {
-                    SpoofSMBIOS(fi->TableBuffer, fi->DataLength);
-                    g_SpoofedSMBIOSLen = fi->DataLength;
+                if (NT_SUCCESS(st) && fi->TableBufferLength > 0) {
+                    SpoofSMBIOS(fi->TableBuffer, fi->TableBufferLength);
+                    g_SpoofedSMBIOSLen = fi->TableBufferLength;
                     g_SpoofedSMBIOS = (PUCHAR)ExAllocatePoolWithTag(
-                        NonPagedPool, fi->DataLength, 'bmsS');
+                        NonPagedPool, fi->TableBufferLength, 'bmsS');
                     if (g_SpoofedSMBIOS) {
-                        RtlCopyMemory(g_SpoofedSMBIOS, fi->TableBuffer, fi->DataLength);
+                        RtlCopyMemory(g_SpoofedSMBIOS, fi->TableBuffer, fi->TableBufferLength);
                     }
                 }
                 ExFreePoolWithTag(fi, 'bmsR');
