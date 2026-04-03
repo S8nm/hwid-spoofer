@@ -1122,6 +1122,13 @@ void DoSpoofHWID() {
 void DoRevertHWID() {
     if (!g_SpooferLoaded) return;
 
+    HANDLE hEvt = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\HWIDSpooferRevert");
+    if (hEvt) {
+        SetEvent(hEvt);
+        CloseHandle(hEvt);
+        Sleep(200);
+    }
+
     UnloadSpooferDriver();
     g_SpooferLoaded = FALSE;
     g_LogLoaded = FALSE;
