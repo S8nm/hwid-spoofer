@@ -136,7 +136,6 @@ static BOOL g_LogLoaded = FALSE;
 
 static CHAR g_TempDir[MAX_PATH] = {0};
 static CHAR g_VulnDriverPath[MAX_PATH] = {0};
-static CHAR g_SpooferPath[MAX_PATH] = {0};
 static CHAR g_VulnServiceName[32] = {0};
 static CHAR g_VulnDeviceName[64] = {0};
 
@@ -252,7 +251,7 @@ ULONG64 KM_FindCodeCave(SIZE_T needed);
 BOOL KM_ExecuteInKernel(ULONG64 funcAddr);
 ULONG64 KM_AllocateKernelPool(SIZE_T size);
 BOOL KM_CallDriverEntry(ULONG64 entryAddr);
-BOOL KM_MapDriver(const char* path);
+BOOL KM_MapDriverFromMemory(PVOID buffer, DWORD size);
 void DrawPanel(HDC hdc, RECT* rc, const char* title);
 void DrawTextLine(HDC hdc, int x, int y, const char* label, const char* value, COLORREF valColor);
 
@@ -1064,9 +1063,7 @@ void DoSpoofHWID() {
         Sleep(500);
     }
 
-    // Extract embedded driver files if needed
-    if (GetFileAttributesA(g_VulnDriverPath) == INVALID_FILE_ATTRIBUTES ||
-        GetFileAttributesA(g_SpooferPath) == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesA(g_VulnDriverPath) == INVALID_FILE_ATTRIBUTES) {
         if (!ExtractDriverFiles()) {
             MessageBoxA(g_hWnd,
                 "Failed to extract embedded driver files.",
@@ -1201,12 +1198,9 @@ BOOL CreateHiddenTempDirectory() {
     }
     SetFileAttributesA(g_TempDir, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
 
-    // Random filenames with innocent-looking extensions
-    char randName1[13], randName2[13];
+    char randName1[13];
     GenerateRandomHexName(randName1, sizeof(randName1));
-    GenerateRandomHexName(randName2, sizeof(randName2));
     sprintf_s(g_VulnDriverPath, sizeof(g_VulnDriverPath), "%s\\%s.tmp", g_TempDir, randName1);
-    sprintf_s(g_SpooferPath, sizeof(g_SpooferPath), "%s\\%s.tmp", g_TempDir, randName2);
 
     // Random service name (8 hex chars)
     GenerateRandomHexName(g_VulnServiceName, 9);
@@ -1239,14 +1233,11 @@ BOOL ExtractResource(int resourceId, const char* outputPath) {
 }
 
 BOOL ExtractDriverFiles() {
-    if (!ExtractResource(IDR_VULN_SYS, g_VulnDriverPath)) return FALSE;
-    if (!ExtractResource(IDR_SPOOFER_SYS, g_SpooferPath)) return FALSE;
-    return TRUE;
+    return ExtractResource(IDR_VULN_SYS, g_VulnDriverPath);
 }
 
 void CleanupTempFiles() {
     SecureWipeFile(g_VulnDriverPath);
-    SecureWipeFile(g_SpooferPath);
     RemoveDirectoryA(g_TempDir);
 }
 
@@ -1584,19 +1575,8 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
     return ((LONG)ntStatus >= 0);
 }
 
-BOOL KM_MapDriver(const char* path) {
-    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
-
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    PVOID fileBuffer = malloc(fileSize);
-    if (!fileBuffer) { CloseHandle(hFile); return FALSE; }
-
-    DWORD bytesRead = 0;
-    ReadFile(hFile, fileBuffer, fileSize, &bytesRead, NULL);
-    CloseHandle(hFile);
-
-    if (bytesRead != fileSize) { free(fileBuffer); return FALSE; }
+BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
+    if (!fileBuffer || fileSize < sizeof(IMAGE_DOS_HEADER)) return FALSE;
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)fileBuffer;
     PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((BYTE*)fileBuffer + dos->e_lfanew);
@@ -1605,7 +1585,7 @@ BOOL KM_MapDriver(const char* path) {
     DWORD entryRVA = nt->OptionalHeader.AddressOfEntryPoint;
 
     PVOID localImage = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!localImage) { free(fileBuffer); return FALSE; }
+    if (!localImage) return FALSE;
 
     memcpy(localImage, fileBuffer, nt->OptionalHeader.SizeOfHeaders);
 
@@ -1618,8 +1598,6 @@ BOOL KM_MapDriver(const char* path) {
                 sec[i].SizeOfRawData);
         }
     }
-
-    free(fileBuffer);
 
     ULONG64 kernelPool = KM_AllocateKernelPool(imageSize);
     if (!kernelPool) {
@@ -1649,12 +1627,20 @@ BOOL LoadSpooferDriver() {
         return FALSE;
     }
 
-    if (!KM_MapDriver(g_SpooferPath)) {
+    HRSRC hRes = FindResourceA(g_hInst, MAKEINTRESOURCEA(IDR_SPOOFER_SYS), RT_RCDATA);
+    if (!hRes) { UnloadVulnerableDriver(); return FALSE; }
+
+    HGLOBAL hData = LoadResource(g_hInst, hRes);
+    if (!hData) { UnloadVulnerableDriver(); return FALSE; }
+
+    DWORD resSize = SizeofResource(g_hInst, hRes);
+    PVOID resData = LockResource(hData);
+    if (!resData || resSize == 0) { UnloadVulnerableDriver(); return FALSE; }
+
+    if (!KM_MapDriverFromMemory(resData, resSize)) {
         UnloadVulnerableDriver();
         return FALSE;
     }
-
-    SecureWipeFile(g_SpooferPath);
 
     UnloadVulnerableDriver();
 
