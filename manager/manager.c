@@ -232,6 +232,7 @@ BOOL UnloadSpooferDriver();
 BOOL IsAdmin();
 BOOL ReadHwidLog();
 void SaveHwidLogToDocuments();
+static void SignalDriverRevert();
 
 // Kdmapper integrated functions
 BOOL LoadVulnerableDriver();
@@ -430,7 +431,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_SpooferLoaded && g_SpoofExpiry > 0) {
                 ULONGLONG now = GetTickCount64();
                 if (now >= g_SpoofExpiry) {
-                    strcpy_s(g_TimeRemaining, sizeof(g_TimeRemaining), "Expiring...");
+                    KillTimer(hWnd, IDT_DURATION_TIMER);
+                    g_SpoofExpiry = 0;
+                    DoRevertHWID();
+                    InvalidateRect(hWnd, NULL, TRUE);
+                    break;
                 } else {
                     ULONGLONG remaining = (g_SpoofExpiry - now) / 1000;
                     int days = (int)(remaining / 86400);
@@ -1021,8 +1026,6 @@ void SaveHwidLogToDocuments() {
     DeleteFileA("C:\\ProgramData\\hwid_log.bin");
 }
 
-// ==================== RANDOM GENERATION ====================
-
 // ==================== SPOOF / REVERT ====================
 
 static void SignalDriverRevert() {
@@ -1094,7 +1097,8 @@ void DoSpoofHWID() {
 
     if (durationMs > 0) {
         g_SpoofExpiry = GetTickCount64() + durationMs;
-        SetTimer(g_hWnd, IDT_DURATION_TIMER, (UINT)(durationMs > 0xFFFFFFFF ? 0xFFFFFFFF : durationMs), NULL);
+        UINT timerMs = (durationMs > 0x7FFFFFFF) ? 0x7FFFFFFF : (UINT)durationMs;
+        SetTimer(g_hWnd, IDT_DURATION_TIMER, timerMs, NULL);
     }
 
     // Wait a moment, then refresh current IDs
