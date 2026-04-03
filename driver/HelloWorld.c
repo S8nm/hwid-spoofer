@@ -132,6 +132,9 @@ static PUCHAR g_SpoofedSMBIOS    = NULL;
 static ULONG  g_SpoofedSMBIOSLen = 0;
 static PKEVENT g_pRevertEvent    = NULL;
 
+static CHAR g_OrigBV[64] = {0};
+static CHAR g_OrigPN[48] = {0};
+
 static IDLOG g_Log  = {0};
 static BOOLEAN g_Logged = FALSE;
 
@@ -269,12 +272,25 @@ static VOID ByteToHex(UCHAR b, CHAR* out) {
     out[1] = h[b & 0xF];
 }
 
-static VOID FormatUUID(CHAR* dst, SIZE_T dstSz, const UCHAR* uuid) {
+static VOID FormatUUID(CHAR* dst, SIZE_T dstSz, const UCHAR* u) {
     CHAR buf[48];
     int p = 0;
-    for (int i = 0; i < 16; i++) {
-        ByteToHex(uuid[i], &buf[p]); p += 2;
-        if (i == 3 || i == 5 || i == 7 || i == 9) buf[p++] = '-';
+    ByteToHex(u[3], &buf[p]); p += 2;
+    ByteToHex(u[2], &buf[p]); p += 2;
+    ByteToHex(u[1], &buf[p]); p += 2;
+    ByteToHex(u[0], &buf[p]); p += 2;
+    buf[p++] = '-';
+    ByteToHex(u[5], &buf[p]); p += 2;
+    ByteToHex(u[4], &buf[p]); p += 2;
+    buf[p++] = '-';
+    ByteToHex(u[7], &buf[p]); p += 2;
+    ByteToHex(u[6], &buf[p]); p += 2;
+    buf[p++] = '-';
+    ByteToHex(u[8], &buf[p]); p += 2;
+    ByteToHex(u[9], &buf[p]); p += 2;
+    buf[p++] = '-';
+    for (int i = 10; i < 16; i++) {
+        ByteToHex(u[i], &buf[p]); p += 2;
     }
     buf[p] = '\0';
     RtlStringCbCopyA(dst, dstSz, buf);
@@ -304,7 +320,8 @@ static VOID GenAllIDs() {
     g_MC[0] = 0x02;
     for (int i = 1; i < 6; i++) g_MC[i] = (UCHAR)(Rng() & 0xFF);
 
-    g_VS = (Rng() << 16) | Rng();
+    Rng();
+    g_VS = g_Rng;
 
     RtlStringCbCopyA(g_GP, sizeof(g_GP), "GPU-");
     RandHex(g_GP + 4, 13);
@@ -639,6 +656,8 @@ static VOID SpoofRegistry() {
             RegReadStr(hk, L"SystemSerialNumber", g_Log.OBs, 64);
             RegReadStr(hk, L"BaseBoardSerialNumber", g_Log.OMs, 64);
         }
+        RegReadStr(hk, L"BIOSVersion", g_OrigBV, 64);
+        RegReadStr(hk, L"SystemProductName", g_OrigPN, 48);
         RegSetStr(hk, L"SystemSerialNumber", g_BS);
         RegSetStr(hk, L"BaseBoardSerialNumber", g_MB);
         RegSetStr(hk, L"BIOSVersion", g_FR);
@@ -688,6 +707,53 @@ static VOID SpoofMACRegistry() {
     }
 }
 
+// ==================== REGISTRY REVERT ====================
+
+static VOID RevertRegistry() {
+    UNICODE_STRING kp; OBJECT_ATTRIBUTES oa; HANDLE hk; NTSTATUS st;
+
+    RtlInitUnicodeString(&kp, L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\BIOS");
+    InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
+    if (NT_SUCCESS(st)) {
+        if (g_Log.OBs[0]) RegSetStr(hk, L"SystemSerialNumber", g_Log.OBs);
+        if (g_Log.OMs[0]) RegSetStr(hk, L"BaseBoardSerialNumber", g_Log.OMs);
+        if (g_OrigBV[0])  RegSetStr(hk, L"BIOSVersion", g_OrigBV);
+        if (g_OrigPN[0])  RegSetStr(hk, L"SystemProductName", g_OrigPN);
+        ZwClose(hk);
+    }
+
+    RtlInitUnicodeString(&kp,
+        L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000");
+    InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
+    if (NT_SUCCESS(st)) {
+        if (g_Log.OGp[0]) RegSetStr(hk, L"HardwareInformation.AdapterString", g_Log.OGp);
+        ZwClose(hk);
+    }
+}
+
+static VOID RevertMACRegistry() {
+    WCHAR keyPath[256];
+    UNICODE_STRING kp, vn;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE hk;
+
+    RtlInitUnicodeString(&vn, L"NetworkAddress");
+
+    for (int i = 0; i < 20; i++) {
+        RtlStringCbPrintfW(keyPath, sizeof(keyPath),
+            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            L"{4d36e972-e325-11ce-bfc1-08002be10318}\\%04d", i);
+        RtlInitUnicodeString(&kp, keyPath);
+        InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ZwOpenKey(&hk, KEY_SET_VALUE, &oa))) {
+            ZwDeleteValueKey(hk, &vn);
+            ZwClose(hk);
+        }
+    }
+}
+
 // ==================== REVERT THREAD ====================
 
 static VOID RevertThread(PVOID context) {
@@ -698,6 +764,9 @@ static VOID RevertThread(PVOID context) {
     HookRemove(&g_hNdis);
     HookRemove(&g_hFs);
     HookRemove(&g_hSysInfo);
+
+    RevertRegistry();
+    RevertMACRegistry();
 
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -776,6 +845,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
             ObReferenceObjectByHandle(hEvt, EVENT_ALL_ACCESS,
                 *ExEventObjectType, KernelMode, (PVOID*)&g_pRevertEvent, NULL);
             ZwClose(hEvt);
+
+            KeClearEvent(g_pRevertEvent);
 
             HANDLE hThread;
             PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,

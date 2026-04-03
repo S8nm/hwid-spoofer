@@ -217,8 +217,6 @@ BOOL GetBoardSerial(char* buffer, size_t bufferSize);
 BOOL GetSystemUUID(char* buffer, size_t bufferSize);
 BOOL GetVolumeSerialNum(ULONG* serial);
 BOOL GetGPUID(char* buffer, size_t bufferSize);
-void GenerateRandomSerial(char* buffer, size_t bufferSize);
-void GenerateRandomMAC(UCHAR* mac);
 void DoSpoofHWID();
 void DoRevertHWID();
 void UpdateStatus();
@@ -707,6 +705,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hWnd, IDT_DURATION_TIMER);
         KillTimer(hWnd, IDT_COUNTDOWN_TIMER);
         if (g_SpooferLoaded) {
+            SignalDriverRevert();
             UnloadSpooferDriver();
         }
         CleanupTempFiles();
@@ -1024,25 +1023,16 @@ void SaveHwidLogToDocuments() {
 
 // ==================== RANDOM GENERATION ====================
 
-void GenerateRandomSerial(char* buffer, size_t bufferSize) {
-    const char* prefixes[] = {"WD-WMA", "WD-WXJ", "S3Y9N", "Z1D2E", "CVEM", "BTPR"};
-    int prefixIdx = rand() % 6;
-    char suffix[20];
-    for (int i = 0; i < 12; i++) {
-        int r = rand() % 36;
-        suffix[i] = (r < 10) ? ('0' + r) : ('A' + r - 10);
-    }
-    suffix[12] = '\0';
-    sprintf_s(buffer, bufferSize, "%s%s", prefixes[prefixIdx], suffix);
-}
-
-void GenerateRandomMAC(UCHAR* mac) {
-    for (int i = 0; i < 6; i++)
-        mac[i] = (UCHAR)(rand() & 0xFF);
-    mac[0] = (mac[0] & 0xFE) | 0x02; // Locally administered, unicast
-}
-
 // ==================== SPOOF / REVERT ====================
+
+static void SignalDriverRevert() {
+    HANDLE hEvt = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\HWIDSpooferRevert");
+    if (hEvt) {
+        SetEvent(hEvt);
+        CloseHandle(hEvt);
+        Sleep(200);
+    }
+}
 
 void UpdateStatus() {
     if (g_SpooferLoaded) {
@@ -1056,11 +1046,11 @@ void UpdateStatus() {
 }
 
 void DoSpoofHWID() {
-    // If already loaded, revert first (for "randomize again")
     if (g_SpooferLoaded) {
+        SignalDriverRevert();
         UnloadSpooferDriver();
         g_SpooferLoaded = FALSE;
-        Sleep(500);
+        Sleep(300);
     }
 
     if (GetFileAttributesA(g_VulnDriverPath) == INVALID_FILE_ATTRIBUTES) {
@@ -1122,13 +1112,7 @@ void DoSpoofHWID() {
 void DoRevertHWID() {
     if (!g_SpooferLoaded) return;
 
-    HANDLE hEvt = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\HWIDSpooferRevert");
-    if (hEvt) {
-        SetEvent(hEvt);
-        CloseHandle(hEvt);
-        Sleep(200);
-    }
-
+    SignalDriverRevert();
     UnloadSpooferDriver();
     g_SpooferLoaded = FALSE;
     g_LogLoaded = FALSE;
@@ -1176,6 +1160,7 @@ void SecureWipeFile(const char* path) {
             DWORD toWrite = (remaining < chunkSize) ? (DWORD)remaining : chunkSize;
             DWORD written = 0;
             WriteFile(hFile, zeros, toWrite, &written, NULL);
+            if (written == 0) break;
             remaining -= written;
         }
         FlushFileBuffers(hFile);
