@@ -1356,6 +1356,12 @@ VOID UnloadVulnerableDriver() {
 }
 
 PVOID KM_GetKernelBase() {
+    LPVOID drivers[1024];
+    DWORD needed = 0;
+    if (EnumDeviceDrivers(drivers, sizeof(drivers), &needed) && needed >= sizeof(LPVOID)) {
+        return drivers[0];
+    }
+
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (!ntdll) return NULL;
 
@@ -1365,6 +1371,7 @@ PVOID KM_GetKernelBase() {
 
     ULONG size = 0;
     NtQSI(11, NULL, 0, &size);
+    if (size == 0) return NULL;
 
     SYSTEM_MODULE_INFO* modules = (SYSTEM_MODULE_INFO*)malloc(size);
     if (!modules) return NULL;
