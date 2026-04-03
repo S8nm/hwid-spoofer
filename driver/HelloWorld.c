@@ -15,11 +15,8 @@ extern NTSTATUS NTAPI ObReferenceObjectByName(
 NTSYSCALLAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     ULONG SystemInformationClass, PVOID SystemInformation,
     ULONG SystemInformationLength, PULONG ReturnLength);
-NTSYSCALLAPI NTSTATUS NTAPI ZwSetSystemInformation(
-    ULONG SystemInformationClass, PVOID SystemInformation,
-    ULONG SystemInformationLength);
 
-// ==================== CONSTANTS (obfuscated at compile) ====================
+// ==================== CONSTANTS ====================
 
 #define IO_SMART         0x7C088
 #define IO_ATA           0x4D02C
@@ -34,6 +31,7 @@ typedef struct _IH {
     PVOID Det;
     UCHAR SavedBytes[14];
     UCHAR PatchBytes[14];
+    PVOID Trampoline;
     BOOLEAN Active;
     KSPIN_LOCK Lock;
 } IH, *PIH;
@@ -85,6 +83,14 @@ typedef struct _FS_VOL_INFO {
     WCHAR Label[1];
 } FS_VOL_INFO;
 
+typedef struct _FW_TABLE_INFO {
+    ULONG Action;
+    ULONG DataLength;
+    ULONG TableProvSig;
+    ULONG TableId;
+    UCHAR TableBuffer[1];
+} FW_TABLE_INFO;
+
 #pragma pack(push, 1)
 typedef struct _IDLOG {
     CHAR Sig[8];
@@ -101,24 +107,30 @@ typedef struct _IDLOG {
 #pragma pack(pop)
 
 typedef NTSTATUS (*FnDispatch)(PDEVICE_OBJECT, PIRP);
+typedef NTSTATUS (NTAPI *FnNtQuerySysInfo)(ULONG, PVOID, ULONG, PULONG);
 
 // ==================== GLOBALS ====================
 
 extern POBJECT_TYPE *IoDriverObjectType;
 
-static CHAR g_DS[64]  = {0};  // disk serial
-static CHAR g_MN[48]  = {0};  // model number
-static CHAR g_FR[16]  = {0};  // firmware rev
-static CHAR g_BS[64]  = {0};  // BIOS serial
-static CHAR g_MB[64]  = {0};  // board serial
-static UCHAR g_UU[16] = {0};  // UUID
-static UCHAR g_MC[6]  = {0};  // MAC
-static ULONG g_VS     = 0;    // volume serial
-static CHAR g_GP[64]  = {0};  // GPU id
+static CHAR g_DS[64]  = {0};
+static CHAR g_MN[48]  = {0};
+static CHAR g_FR[16]  = {0};
+static CHAR g_BS[64]  = {0};
+static CHAR g_MB[64]  = {0};
+static UCHAR g_UU[16] = {0};
+static UCHAR g_MC[6]  = {0};
+static ULONG g_VS     = 0;
+static CHAR g_GP[64]  = {0};
 
-static IH g_hDisk  = {0};
-static IH g_hNdis  = {0};
-static IH g_hFs    = {0};
+static IH g_hDisk    = {0};
+static IH g_hNdis    = {0};
+static IH g_hFs      = {0};
+static IH g_hSysInfo = {0};
+
+static PUCHAR g_SpoofedSMBIOS    = NULL;
+static ULONG  g_SpoofedSMBIOSLen = 0;
+static PKEVENT g_pRevertEvent    = NULL;
 
 static IDLOG g_Log  = {0};
 static BOOLEAN g_Logged = FALSE;
@@ -159,7 +171,7 @@ static BOOLEAN SafeWrite(PVOID dst, PVOID src, SIZE_T sz) {
     return NT_SUCCESS(st);
 }
 
-// ==================== INLINE HOOK ENGINE (SPINLOCK PROTECTED) ====================
+// ==================== INLINE HOOK ENGINE (TRAMPOLINE-BASED) ====================
 
 static BOOLEAN HookInstall(PVOID target, PVOID detour, PIH h) {
     if (!target || !detour || !h) return FALSE;
@@ -178,8 +190,21 @@ static BOOLEAN HookInstall(PVOID target, PVOID detour, PIH h) {
     h->Orig = target;
     h->Det = detour;
 
-    if (!SafeWrite(target, h->PatchBytes, 14))
+    PVOID tramp = ExAllocatePoolWithTag(NonPagedPool, 32, 'prmT');
+    if (!tramp) return FALSE;
+
+    RtlCopyMemory(tramp, h->SavedBytes, 14);
+    PUCHAR jmp = (PUCHAR)tramp + 14;
+    jmp[0] = 0x48; jmp[1] = 0xB8;
+    *(PVOID*)(jmp + 2) = (PUCHAR)target + 14;
+    jmp[10] = 0xFF; jmp[11] = 0xE0;
+    h->Trampoline = tramp;
+
+    if (!SafeWrite(target, h->PatchBytes, 14)) {
+        ExFreePoolWithTag(tramp, 'prmT');
+        h->Trampoline = NULL;
         return FALSE;
+    }
 
     h->Active = TRUE;
     return TRUE;
@@ -191,29 +216,12 @@ static VOID HookRemove(PIH h) {
     h->Active = FALSE;
 }
 
-static NTSTATUS CallOrig(PIH h, PDEVICE_OBJECT dev, PIRP irp, PVOID detour) {
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&h->Lock, &oldIrql);
-    SafeWrite(h->Orig, h->SavedBytes, 14);
-    KeReleaseSpinLock(&h->Lock, oldIrql);
-
-    FnDispatch fn = (FnDispatch)h->Orig;
-    NTSTATUS status = fn(dev, irp);
-
-    KeAcquireSpinLock(&h->Lock, &oldIrql);
-    SafeWrite(h->Orig, h->PatchBytes, 14);
-    KeReleaseSpinLock(&h->Lock, oldIrql);
-
-    return status;
+static NTSTATUS CallOrig(PIH h, PDEVICE_OBJECT dev, PIRP irp) {
+    FnDispatch fn = (FnDispatch)h->Trampoline;
+    return fn(dev, irp);
 }
 
 // ==================== FIND DRIVER DISPATCH ====================
-
-static VOID DecodeStr(WCHAR* out, const UCHAR* enc, SIZE_T len, UCHAR key) {
-    for (SIZE_T i = 0; i < len; i++)
-        out[i] = (WCHAR)(enc[i] ^ key);
-    out[len] = 0;
-}
 
 static PVOID FindDispatch(PCWSTR name, ULONG mj) {
     UNICODE_STRING uName;
@@ -273,10 +281,9 @@ static VOID FormatUUID(CHAR* dst, SIZE_T dstSz, const UCHAR* uuid) {
 }
 
 static VOID GenAllIDs() {
-    LARGE_INTEGER perf, perf2;
+    LARGE_INTEGER perf;
     perf = KeQueryPerformanceCounter(NULL);
-    perf2 = KeQueryPerformanceCounter(NULL);
-    g_Rng = perf.LowPart ^ perf2.HighPart ^ 0x5A3C1E7D;
+    g_Rng = perf.LowPart ^ perf.HighPart ^ 0x5A3C1E7D;
 
     RtlStringCbCopyA(g_DS, sizeof(g_DS), "WD-WMAZA");
     RandHex(g_DS + 8, 9);
@@ -297,7 +304,7 @@ static VOID GenAllIDs() {
     g_MC[0] = 0x02;
     for (int i = 1; i < 6; i++) g_MC[i] = (UCHAR)(Rng() & 0xFF);
 
-    g_VS = perf.LowPart ^ perf2.HighPart ^ 0xABCD1234;
+    g_VS = (Rng() << 16) | Rng();
 
     RtlStringCbCopyA(g_GP, sizeof(g_GP), "GPU-");
     RandHex(g_GP + 4, 13);
@@ -349,7 +356,6 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
         PUCHAR strings = data + hdr->Length;
         if (strings >= end) break;
 
-        // Type 0: BIOS
         if (hdr->Type == 0 && hdr->Length >= 0x12) {
             UCHAR idx = data[0x05];
             UCHAR num = 1;
@@ -365,7 +371,6 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             }
         }
 
-        // Type 1: System (UUID + serial)
         if (hdr->Type == 1 && hdr->Length >= 0x19) {
             if (data + 0x08 + 16 <= end) {
                 if (!g_Logged)
@@ -385,7 +390,6 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             }
         }
 
-        // Type 2: Baseboard
         if (hdr->Type == 2 && hdr->Length >= 0x08) {
             UCHAR idx = data[0x07];
             UCHAR num = 1;
@@ -401,7 +405,6 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             }
         }
 
-        // Type 3: Chassis
         if (hdr->Type == 3 && hdr->Length >= 0x09) {
             UCHAR idx = data[0x07];
             UCHAR num = 1;
@@ -486,7 +489,7 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         ULONG savedPropId = (ULONG)-1;
         if (b) savedPropId = ((PSTORAGE_PROPERTY_QUERY)b)->PropertyId;
 
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && savedPropId == StorageDeviceProperty &&
             irp->IoStatus.Information > sizeof(STORAGE_DEVICE_DESCRIPTOR) && b) {
             SpoofStorageQP(b, irp->IoStatus.Information);
@@ -494,13 +497,13 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         return st;
     }
     if (code == IO_SMART) {
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer)
             SpoofSMART(irp->AssociatedIrp.SystemBuffer, (ULONG)irp->IoStatus.Information);
         return st;
     }
     if (code == IO_ATA || code == IO_ATA_D) {
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer) {
             PATA_PT a = (PATA_PT)irp->AssociatedIrp.SystemBuffer;
             if (a->CurTF[6] == ID_ATA_IDENT && a->DataLen >= 512)
@@ -509,18 +512,18 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         return st;
     }
     if (code == IO_NVME_CMD) {
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
+        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 64 && irp->AssociatedIrp.SystemBuffer) {
             PUCHAR d = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
-            SIZE_T sl = min(strlen(g_DS), 20);
+            SIZE_T slen = min(strlen(g_DS), 20);
             if (irp->IoStatus.Information > 64) {
                 RtlZeroMemory(d + 44, 20);
-                RtlCopyMemory(d + 44, g_DS, sl);
+                RtlCopyMemory(d + 44, g_DS, slen);
             }
         }
         return st;
     }
-    return CallOrig(&g_hDisk, dev, irp, HkDisk);
+    return CallOrig(&g_hDisk, dev, irp);
 }
 
 // ==================== NDIS HOOK ====================
@@ -532,7 +535,7 @@ NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
 
     if (sp->MajorFunction == IRP_MJ_INTERNAL_DEVICE_CONTROL ||
         sp->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
-        NTSTATUS st = CallOrig(&g_hNdis, dev, irp, HkNdis);
+        NTSTATUS st = CallOrig(&g_hNdis, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information >= 6) {
             PUCHAR mac = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
             if (mac) {
@@ -546,7 +549,7 @@ NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
         }
         return st;
     }
-    return CallOrig(&g_hNdis, dev, irp, HkNdis);
+    return CallOrig(&g_hNdis, dev, irp);
 }
 
 // ==================== FS HOOK (VOLUME SERIAL) ====================
@@ -555,7 +558,7 @@ NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp);
 
 NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
-    NTSTATUS st = CallOrig(&g_hFs, dev, irp, HkFs);
+    NTSTATUS st = CallOrig(&g_hFs, dev, irp);
 
     if (NT_SUCCESS(st) &&
         sp->Parameters.QueryVolume.FsInformationClass == 1 &&
@@ -566,6 +569,26 @@ NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
             vi->SerialNumber = g_VS;
         }
     }
+    return st;
+}
+
+// ==================== SMBIOS QUERY HOOK ====================
+
+NTSTATUS NTAPI HkNtQuerySysInfo(ULONG Class, PVOID Info, ULONG Length, PULONG RetLength) {
+    FnNtQuerySysInfo orig = (FnNtQuerySysInfo)g_hSysInfo.Trampoline;
+    NTSTATUS st = orig(Class, Info, Length, RetLength);
+
+    if (NT_SUCCESS(st) && Class == 76 && Info && g_SpoofedSMBIOS) {
+        __try {
+            FW_TABLE_INFO* fi = (FW_TABLE_INFO*)Info;
+            if (fi->Action == 1 && fi->TableProvSig == 'RSMB' && fi->DataLength > 0) {
+                ULONG copyLen = fi->DataLength < g_SpoofedSMBIOSLen
+                    ? fi->DataLength : g_SpoofedSMBIOSLen;
+                RtlCopyMemory(fi->TableBuffer, g_SpoofedSMBIOS, copyLen);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    }
+
     return st;
 }
 
@@ -636,6 +659,49 @@ static VOID SpoofRegistry() {
     }
 }
 
+// ==================== MAC REGISTRY SPOOFING ====================
+
+static VOID SpoofMACRegistry() {
+    static const CHAR hex[] = "0123456789ABCDEF";
+    CHAR macStr[13];
+    for (int j = 0; j < 6; j++) {
+        macStr[j * 2]     = hex[(g_MC[j] >> 4) & 0xF];
+        macStr[j * 2 + 1] = hex[g_MC[j] & 0xF];
+    }
+    macStr[12] = '\0';
+
+    WCHAR keyPath[256];
+    UNICODE_STRING kp;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE hk;
+
+    for (int i = 0; i < 20; i++) {
+        RtlStringCbPrintfW(keyPath, sizeof(keyPath),
+            L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            L"{4d36e972-e325-11ce-bfc1-08002be10318}\\%04d", i);
+        RtlInitUnicodeString(&kp, keyPath);
+        InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        if (NT_SUCCESS(ZwOpenKey(&hk, KEY_SET_VALUE, &oa))) {
+            RegSetStr(hk, L"NetworkAddress", macStr);
+            ZwClose(hk);
+        }
+    }
+}
+
+// ==================== REVERT THREAD ====================
+
+static VOID RevertThread(PVOID context) {
+    UNREFERENCED_PARAMETER(context);
+    KeWaitForSingleObject(g_pRevertEvent, Executive, KernelMode, FALSE, NULL);
+
+    HookRemove(&g_hDisk);
+    HookRemove(&g_hNdis);
+    HookRemove(&g_hFs);
+    HookRemove(&g_hSysInfo);
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 // ==================== ENTRY ====================
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
@@ -644,7 +710,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     GenAllIDs();
 
-    // Hook disk driver (covers StorageQuery, SMART, ATA, NVMe)
     PVOID fn = NULL;
     const WCHAR* drvs[] = { L"\\Driver\\disk", L"\\Driver\\storahci", L"\\Driver\\stornvme" };
     for (int i = 0; i < 3; i++) {
@@ -653,53 +718,71 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     }
     if (fn) HookInstall(fn, HkDisk, &g_hDisk);
 
-    // Hook NDIS for MAC
     fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_DEVICE_CONTROL);
     if (!fn) fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_INTERNAL_DEVICE_CONTROL);
     if (fn) HookInstall(fn, HkNdis, &g_hNdis);
 
-    // Hook NTFS for volume serial
     fn = FindDispatch(L"\\FileSystem\\Ntfs", IRP_MJ_QUERY_VOLUME_INFORMATION);
     if (fn) HookInstall(fn, HkFs, &g_hFs);
 
-    // Patch SMBIOS tables (UUID, BIOS/board/chassis serials)
     {
-        typedef struct {
-            ULONG Action;       // 1 = query
-            ULONG DataLength;
-            ULONG TableProvSig; // 'RSMB'
-            ULONG TableId;
-            UCHAR TableBuffer[1];
-        } SYSTEM_FIRMWARE_TABLE_INFO;
-
         ULONG needed = 0;
-        SYSTEM_FIRMWARE_TABLE_INFO probe = {0};
+        FW_TABLE_INFO probe = {0};
         probe.Action = 1;
         probe.TableProvSig = 'RSMB';
-        NTSTATUS st = ZwQuerySystemInformation(76, &probe, sizeof(probe), &needed);
+        ZwQuerySystemInformation(76, &probe, sizeof(probe), &needed);
         if (needed > 0) {
-            SYSTEM_FIRMWARE_TABLE_INFO* fi =
-                (SYSTEM_FIRMWARE_TABLE_INFO*)ExAllocatePoolWithTag(NonPagedPool, needed, 'bmsR');
+            FW_TABLE_INFO* fi =
+                (FW_TABLE_INFO*)ExAllocatePoolWithTag(NonPagedPool, needed, 'bmsR');
             if (fi) {
                 RtlZeroMemory(fi, needed);
                 fi->Action = 1;
                 fi->TableProvSig = 'RSMB';
-                st = ZwQuerySystemInformation(76, fi, needed, &needed);
+                NTSTATUS st = ZwQuerySystemInformation(76, fi, needed, &needed);
                 if (NT_SUCCESS(st) && fi->DataLength > 0) {
                     SpoofSMBIOS(fi->TableBuffer, fi->DataLength);
-                    ZwSetSystemInformation(76, fi, needed);
+                    g_SpoofedSMBIOSLen = fi->DataLength;
+                    g_SpoofedSMBIOS = (PUCHAR)ExAllocatePoolWithTag(
+                        NonPagedPool, fi->DataLength, 'bmsS');
+                    if (g_SpoofedSMBIOS) {
+                        RtlCopyMemory(g_SpoofedSMBIOS, fi->TableBuffer, fi->DataLength);
+                    }
                 }
                 ExFreePoolWithTag(fi, 'bmsR');
             }
         }
+
+        UNICODE_STRING fnName;
+        RtlInitUnicodeString(&fnName, L"NtQuerySystemInformation");
+        PVOID ntQsi = MmGetSystemRoutineAddress(&fnName);
+        if (ntQsi && g_SpoofedSMBIOS) {
+            HookInstall(ntQsi, HkNtQuerySysInfo, &g_hSysInfo);
+        }
     }
 
-    // Direct registry spoofing
     SpoofRegistry();
+    SpoofMACRegistry();
 
-    // Write log
     WriteLog();
+
+    {
+        UNICODE_STRING evtName;
+        RtlInitUnicodeString(&evtName, L"\\BaseNamedObjects\\HWIDSpooferRevert");
+        OBJECT_ATTRIBUTES evtOa;
+        InitializeObjectAttributes(&evtOa, &evtName, OBJ_CASE_INSENSITIVE, NULL, NULL);
+        HANDLE hEvt;
+        if (NT_SUCCESS(ZwCreateEvent(&hEvt, EVENT_ALL_ACCESS, &evtOa,
+                NotificationEvent, FALSE))) {
+            ObReferenceObjectByHandle(hEvt, EVENT_ALL_ACCESS,
+                *ExEventObjectType, KernelMode, (PVOID*)&g_pRevertEvent, NULL);
+            ZwClose(hEvt);
+
+            HANDLE hThread;
+            PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
+                NULL, NULL, NULL, RevertThread, NULL);
+            ZwClose(hThread);
+        }
+    }
 
     return STATUS_SUCCESS;
 }
-
