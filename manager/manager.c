@@ -89,6 +89,20 @@ static CHAR g_CurrentDiskSerial[256] = "(unknown)";
 static UCHAR g_CurrentMAC[6] = {0};
 static BOOL g_CurrentMACValid = FALSE;
 
+static CHAR g_OrigBIOSSerial[256] = "(unknown)";
+static CHAR g_OrigBoardSerial[256] = "(unknown)";
+static CHAR g_OrigSystemUUID[256] = "(unknown)";
+static ULONG g_OrigVolumeSerial = 0;
+static BOOL g_OrigVolumeSerialValid = FALSE;
+static CHAR g_OrigGPUID[256] = "(unknown)";
+
+static CHAR g_CurrBIOSSerial[256] = "(unknown)";
+static CHAR g_CurrBoardSerial[256] = "(unknown)";
+static CHAR g_CurrSystemUUID[256] = "(unknown)";
+static ULONG g_CurrVolumeSerial = 0;
+static BOOL g_CurrVolumeSerialValid = FALSE;
+static CHAR g_CurrGPUID[256] = "(unknown)";
+
 static CHAR g_StatusText[256] = "INACTIVE";
 static COLORREF g_StatusColor = CLR_RED;
 
@@ -199,6 +213,11 @@ void DestroyFonts();
 void ReadAllHWIDs();
 BOOL GetDiskSerial(char* buffer, size_t bufferSize);
 BOOL GetMACAddress(UCHAR* mac);
+BOOL GetBIOSSerial(char* buffer, size_t bufferSize);
+BOOL GetBoardSerial(char* buffer, size_t bufferSize);
+BOOL GetSystemUUID(char* buffer, size_t bufferSize);
+BOOL GetVolumeSerialNum(ULONG* serial);
+BOOL GetGPUID(char* buffer, size_t bufferSize);
 void GenerateRandomSerial(char* buffer, size_t bufferSize);
 void GenerateRandomMAC(UCHAR* mac);
 void DoSpoofHWID();
@@ -267,7 +286,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     wc.hIconSm        = LoadIcon(NULL, IDI_SHIELD);
     RegisterClassExA(&wc);
 
-    int wndW = 540, wndH = 850;
+    int wndW = 540, wndH = 940;
     int scrW = GetSystemMetrics(SM_CXSCREEN);
     int scrH = GetSystemMetrics(SM_CYSCREEN);
 
@@ -373,7 +392,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Duration combo
         g_hComboDuration = CreateWindowExA(0, "COMBOBOX", NULL,
             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
-            290, 670, 190, 200, hWnd, (HMENU)IDC_COMBO_DURATION, g_hInst, NULL);
+            290, 728, 190, 200, hWnd, (HMENU)IDC_COMBO_DURATION, g_hInst, NULL);
         SendMessageA(g_hComboDuration, CB_ADDSTRING, 0, (LPARAM)"1 Day");
         SendMessageA(g_hComboDuration, CB_ADDSTRING, 0, (LPARAM)"7 Days");
         SendMessageA(g_hComboDuration, CB_ADDSTRING, 0, (LPARAM)"30 Days");
@@ -386,6 +405,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         strcpy_s(g_CurrentDiskSerial, sizeof(g_CurrentDiskSerial), g_OriginalDiskSerial);
         memcpy(g_CurrentMAC, g_OriginalMAC, 6);
         g_CurrentMACValid = g_OriginalMACValid;
+        strcpy_s(g_CurrBIOSSerial, sizeof(g_CurrBIOSSerial), g_OrigBIOSSerial);
+        strcpy_s(g_CurrBoardSerial, sizeof(g_CurrBoardSerial), g_OrigBoardSerial);
+        strcpy_s(g_CurrSystemUUID, sizeof(g_CurrSystemUUID), g_OrigSystemUUID);
+        g_CurrVolumeSerial = g_OrigVolumeSerial;
+        g_CurrVolumeSerialValid = g_OrigVolumeSerialValid;
+        strcpy_s(g_CurrGPUID, sizeof(g_CurrGPUID), g_OrigGPUID);
 
         if (!CreateHiddenTempDirectory()) {
             MessageBoxA(hWnd, "Failed to create temp directory.", "Error", MB_ICONERROR);
@@ -460,182 +485,141 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             TextOutA(memDC, clientRect.right - sz.cx - 20, 20, statusBuf, (int)strlen(statusBuf));
         }
 
-        // === Original HWIDs Panel ===
-        RECT panelOrig = {20, 55, clientRect.right - 20, 265};
+        // === Panel 1: Original HWIDs (saved at startup, never changes) ===
+        RECT panelOrig = {20, 55, clientRect.right - 20, 225};
         DrawPanel(memDC, &panelOrig, "ORIGINAL HARDWARE IDs");
         {
-            int y = panelOrig.top + 36;
-            DrawTextLine(memDC, 34, y, "Disk Serial:", g_OriginalDiskSerial, CLR_TEXT);
-            y += 20;
+            int y = panelOrig.top + 32;
             char macStr[32];
+            DrawTextLine(memDC, 34, y, "Disk Serial:", g_OriginalDiskSerial, CLR_TEXT); y += 19;
             if (g_OriginalMACValid)
                 sprintf_s(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
                     g_OriginalMAC[0], g_OriginalMAC[1], g_OriginalMAC[2],
                     g_OriginalMAC[3], g_OriginalMAC[4], g_OriginalMAC[5]);
-            else
-                strcpy_s(macStr, sizeof(macStr), "(unknown)");
-            DrawTextLine(memDC, 34, y, "MAC Address:", macStr, CLR_TEXT);
-            y += 20;
-            if (g_LogLoaded) {
-                DrawTextLine(memDC, 34, y, "BIOS Serial:", g_HwidLog.OrigBIOSSerial[0] ? g_HwidLog.OrigBIOSSerial : "(pending)", CLR_TEXT);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "Board Serial:", g_HwidLog.OrigBoardSerial[0] ? g_HwidLog.OrigBoardSerial : "(pending)", CLR_TEXT);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "System UUID:", g_HwidLog.OrigSystemUUID[0] ? g_HwidLog.OrigSystemUUID : "(pending)", CLR_TEXT);
-                y += 20;
-                char volBuf[32]; sprintf_s(volBuf, sizeof(volBuf), "%08X", g_HwidLog.OrigVolumeSerial[0]);
-                DrawTextLine(memDC, 34, y, "Volume Serial:", g_HwidLog.OrigVolumeSerial[0] ? volBuf : "(pending)", CLR_TEXT);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "GPU ID:", g_HwidLog.OrigGPUId[0] ? g_HwidLog.OrigGPUId : "(pending)", CLR_TEXT);
-            } else {
-                DrawTextLine(memDC, 34, y, "BIOS Serial:", "(spoof to detect)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "Board Serial:", "(spoof to detect)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "System UUID:", "(spoof to detect)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "Volume Serial:", "(spoof to detect)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "GPU ID:", "(spoof to detect)", CLR_TEXT_DIM);
-            }
+            else strcpy_s(macStr, sizeof(macStr), "(unknown)");
+            DrawTextLine(memDC, 34, y, "MAC Address:", macStr, CLR_TEXT); y += 19;
+            DrawTextLine(memDC, 34, y, "BIOS Serial:", g_OrigBIOSSerial, CLR_TEXT); y += 19;
+            DrawTextLine(memDC, 34, y, "Board Serial:", g_OrigBoardSerial, CLR_TEXT); y += 19;
+            DrawTextLine(memDC, 34, y, "System UUID:", g_OrigSystemUUID, CLR_TEXT); y += 19;
+            { char vb[32];
+              if (g_OrigVolumeSerialValid) sprintf_s(vb, sizeof(vb), "%08X", g_OrigVolumeSerial);
+              else strcpy_s(vb, sizeof(vb), "(not available)");
+              DrawTextLine(memDC, 34, y, "Volume Serial:", vb, CLR_TEXT); } y += 19;
+            DrawTextLine(memDC, 34, y, "GPU ID:", g_OrigGPUID, CLR_TEXT);
         }
 
-        // === Current / Spoofed HWIDs Panel ===
-        RECT panelCurr = {20, 275, clientRect.right - 20, 485};
-        DrawPanel(memDC, &panelCurr, g_LogLoaded ? "SPOOFED HARDWARE IDs" : "CURRENT HARDWARE IDs");
+        // === Panel 2: Current HWIDs (live detection — reflects spoof when active) ===
+        RECT panelCurr = {20, 233, clientRect.right - 20, 403};
+        DrawPanel(memDC, &panelCurr, "CURRENT HARDWARE IDs");
         {
-            int y = panelCurr.top + 36;
-            COLORREF diskCol = CLR_TEXT;
-            if (g_SpooferLoaded && strcmp(g_OriginalDiskSerial, g_CurrentDiskSerial) != 0)
-                diskCol = CLR_GREEN;
-            DrawTextLine(memDC, 34, y, "Disk Serial:", g_LogLoaded ? g_HwidLog.FakeDiskSerial : g_CurrentDiskSerial, g_LogLoaded ? CLR_GREEN : diskCol);
-            y += 20;
-
+            int y = panelCurr.top + 32;
             char macStr[32];
+            COLORREF cDisk = (g_SpooferLoaded && strcmp(g_OriginalDiskSerial, g_CurrentDiskSerial) != 0) ? CLR_GREEN : CLR_TEXT;
+            DrawTextLine(memDC, 34, y, "Disk Serial:", g_CurrentDiskSerial, cDisk); y += 19;
+
+            if (g_CurrentMACValid)
+                sprintf_s(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                    g_CurrentMAC[0], g_CurrentMAC[1], g_CurrentMAC[2],
+                    g_CurrentMAC[3], g_CurrentMAC[4], g_CurrentMAC[5]);
+            else strcpy_s(macStr, sizeof(macStr), "(unknown)");
+            COLORREF cMac = (g_SpooferLoaded && g_CurrentMACValid && g_OriginalMACValid &&
+                memcmp(g_OriginalMAC, g_CurrentMAC, 6) != 0) ? CLR_GREEN : CLR_TEXT;
+            DrawTextLine(memDC, 34, y, "MAC Address:", macStr, cMac); y += 19;
+
+            COLORREF cBios = (g_SpooferLoaded && strcmp(g_OrigBIOSSerial, g_CurrBIOSSerial) != 0) ? CLR_GREEN : CLR_TEXT;
+            DrawTextLine(memDC, 34, y, "BIOS Serial:", g_CurrBIOSSerial, cBios); y += 19;
+            COLORREF cBoard = (g_SpooferLoaded && strcmp(g_OrigBoardSerial, g_CurrBoardSerial) != 0) ? CLR_GREEN : CLR_TEXT;
+            DrawTextLine(memDC, 34, y, "Board Serial:", g_CurrBoardSerial, cBoard); y += 19;
+            COLORREF cUuid = (g_SpooferLoaded && strcmp(g_OrigSystemUUID, g_CurrSystemUUID) != 0) ? CLR_GREEN : CLR_TEXT;
+            DrawTextLine(memDC, 34, y, "System UUID:", g_CurrSystemUUID, cUuid); y += 19;
+            { char vb[32];
+              if (g_CurrVolumeSerialValid) sprintf_s(vb, sizeof(vb), "%08X", g_CurrVolumeSerial);
+              else strcpy_s(vb, sizeof(vb), "(not available)");
+              COLORREF cVol = (g_SpooferLoaded && g_CurrVolumeSerial != g_OrigVolumeSerial) ? CLR_GREEN : CLR_TEXT;
+              DrawTextLine(memDC, 34, y, "Volume Serial:", vb, cVol); } y += 19;
+            COLORREF cGpu = (g_SpooferLoaded && strcmp(g_OrigGPUID, g_CurrGPUID) != 0) ? CLR_GREEN : CLR_TEXT;
+            DrawTextLine(memDC, 34, y, "GPU ID:", g_CurrGPUID, cGpu);
+        }
+
+        // === Panel 3: Spoofed To (fake values from driver log) ===
+        RECT panelSpoof = {20, 411, clientRect.right - 20, 581};
+        DrawPanel(memDC, &panelSpoof, "SPOOFED TO");
+        {
+            int y = panelSpoof.top + 32;
             if (g_LogLoaded) {
+                char macStr[32];
+                DrawTextLine(memDC, 34, y, "Disk Serial:", g_HwidLog.FakeDiskSerial, CLR_GREEN); y += 19;
                 sprintf_s(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
                     g_HwidLog.FakeMAC[0], g_HwidLog.FakeMAC[1], g_HwidLog.FakeMAC[2],
                     g_HwidLog.FakeMAC[3], g_HwidLog.FakeMAC[4], g_HwidLog.FakeMAC[5]);
-                DrawTextLine(memDC, 34, y, "MAC Address:", macStr, CLR_GREEN);
-            } else {
-                if (g_CurrentMACValid)
-                    sprintf_s(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                        g_CurrentMAC[0], g_CurrentMAC[1], g_CurrentMAC[2],
-                        g_CurrentMAC[3], g_CurrentMAC[4], g_CurrentMAC[5]);
-                else
-                    strcpy_s(macStr, sizeof(macStr), "(unknown)");
-                COLORREF macCol = CLR_TEXT;
-                if (g_SpooferLoaded && g_CurrentMACValid && g_OriginalMACValid &&
-                    memcmp(g_OriginalMAC, g_CurrentMAC, 6) != 0)
-                    macCol = CLR_GREEN;
-                DrawTextLine(memDC, 34, y, "MAC Address:", macStr, macCol);
-            }
-            y += 20;
-
-            if (g_LogLoaded) {
-                DrawTextLine(memDC, 34, y, "BIOS Serial:", g_HwidLog.FakeBIOSSerial, CLR_GREEN);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "Board Serial:", g_HwidLog.FakeBoardSerial, CLR_GREEN);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "System UUID:", g_HwidLog.FakeSystemUUID, CLR_GREEN);
-                y += 20;
-                char volBuf[32]; sprintf_s(volBuf, sizeof(volBuf), "%08X", g_HwidLog.FakeVolumeSerial[0]);
-                DrawTextLine(memDC, 34, y, "Volume Serial:", volBuf, CLR_GREEN);
-                y += 20;
+                DrawTextLine(memDC, 34, y, "MAC Address:", macStr, CLR_GREEN); y += 19;
+                DrawTextLine(memDC, 34, y, "BIOS Serial:", g_HwidLog.FakeBIOSSerial, CLR_GREEN); y += 19;
+                DrawTextLine(memDC, 34, y, "Board Serial:", g_HwidLog.FakeBoardSerial, CLR_GREEN); y += 19;
+                DrawTextLine(memDC, 34, y, "System UUID:", g_HwidLog.FakeSystemUUID, CLR_GREEN); y += 19;
+                { char vb[32]; sprintf_s(vb, sizeof(vb), "%08X", g_HwidLog.FakeVolumeSerial[0]);
+                  DrawTextLine(memDC, 34, y, "Volume Serial:", vb, CLR_GREEN); } y += 19;
                 DrawTextLine(memDC, 34, y, "GPU ID:", g_HwidLog.FakeGPUId, CLR_GREEN);
             } else {
-                DrawTextLine(memDC, 34, y, "BIOS Serial:", "(inactive)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "Board Serial:", "(inactive)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "System UUID:", "(inactive)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "Volume Serial:", "(inactive)", CLR_TEXT_DIM);
-                y += 20;
-                DrawTextLine(memDC, 34, y, "GPU ID:", "(inactive)", CLR_TEXT_DIM);
+                DrawTextLine(memDC, 34, y, "Disk Serial:", "(not yet spoofed)", CLR_TEXT_DIM); y += 19;
+                DrawTextLine(memDC, 34, y, "MAC Address:", "(not yet spoofed)", CLR_TEXT_DIM); y += 19;
+                DrawTextLine(memDC, 34, y, "BIOS Serial:", "(not yet spoofed)", CLR_TEXT_DIM); y += 19;
+                DrawTextLine(memDC, 34, y, "Board Serial:", "(not yet spoofed)", CLR_TEXT_DIM); y += 19;
+                DrawTextLine(memDC, 34, y, "System UUID:", "(not yet spoofed)", CLR_TEXT_DIM); y += 19;
+                DrawTextLine(memDC, 34, y, "Volume Serial:", "(not yet spoofed)", CLR_TEXT_DIM); y += 19;
+                DrawTextLine(memDC, 34, y, "GPU ID:", "(not yet spoofed)", CLR_TEXT_DIM);
             }
         }
 
-        // === Spoof Info Panel ===
-        RECT panelInfo = {20, 495, clientRect.right - 20, 655};
+        // === Spoof Status Panel ===
+        RECT panelInfo = {20, 589, clientRect.right - 20, 706};
         DrawPanel(memDC, &panelInfo, "SPOOF STATUS");
         {
-            int y = panelInfo.top + 36;
-            SelectObject(memDC, g_hFontNormal);
-            SetTextColor(memDC, CLR_TEXT_DIM);
-
+            int y = panelInfo.top + 32;
             if (g_SpooferLoaded) {
                 SetTextColor(memDC, CLR_GREEN);
                 SelectObject(memDC, g_hFontBold);
-                TextOutA(memDC, 34, y, "Spoofer is ACTIVE - Hardware IDs are randomized", 48);
-                y += 28;
-
+                TextOutA(memDC, 34, y, "Spoofer is ACTIVE", 17); y += 24;
                 SelectObject(memDC, g_hFontNormal);
                 SetTextColor(memDC, CLR_TEXT_DIM);
-
                 const char* durNames[] = {"1 Day", "7 Days", "30 Days", "Until Reboot"};
                 char durBuf[128];
                 sprintf_s(durBuf, sizeof(durBuf), "Duration: %s", durNames[g_SelectedDuration]);
-                TextOutA(memDC, 34, y, durBuf, (int)strlen(durBuf));
-                y += 22;
-
+                TextOutA(memDC, 34, y, durBuf, (int)strlen(durBuf)); y += 20;
                 if (g_SpoofExpiry > 0) {
                     char timeBuf[128];
                     sprintf_s(timeBuf, sizeof(timeBuf), "Time Remaining: %s", g_TimeRemaining);
                     SetTextColor(memDC, CLR_ORANGE);
                     TextOutA(memDC, 34, y, timeBuf, (int)strlen(timeBuf));
                 } else {
-                    SetTextColor(memDC, CLR_TEXT_DIM);
                     TextOutA(memDC, 34, y, "Active until reboot or manual revert", 36);
                 }
-                y += 28;
-
-                SetTextColor(memDC, CLR_TEXT_DIM);
-                SelectObject(memDC, g_hFontSmall);
-                TextOutA(memDC, 34, y, "Each spoof generates completely random IDs.", 43);
-                y += 18;
-                TextOutA(memDC, 34, y, "Click 'Change HWID' again for a new random set.", 48);
             } else {
                 SetTextColor(memDC, CLR_RED);
                 SelectObject(memDC, g_hFontBold);
-                TextOutA(memDC, 34, y, "Spoofer is INACTIVE", 19);
-                y += 28;
-
+                TextOutA(memDC, 34, y, "Spoofer is INACTIVE", 19); y += 24;
                 SetTextColor(memDC, CLR_TEXT_DIM);
                 SelectObject(memDC, g_hFontNormal);
-                TextOutA(memDC, 34, y, "Showing real hardware IDs.", 25);
-                y += 22;
-                TextOutA(memDC, 34, y, "Select a duration and click 'Change HWID' to start.", 52);
-                y += 28;
-
+                TextOutA(memDC, 34, y, "Select a duration and click 'Change HWID' to start.", 52); y += 20;
                 SelectObject(memDC, g_hFontSmall);
-                TextOutA(memDC, 34, y, "All hardware identifiers will be randomized:", 44);
-                y += 18;
-                TextOutA(memDC, 34, y, "Disk, MAC, BIOS, Board, UUID, Volume", 36);
+                TextOutA(memDC, 34, y, "Disk, MAC, BIOS, Board, UUID, Volume, GPU will be randomized", 60);
             }
         }
 
         // === Bottom Controls ===
-        // Duration label
         SelectObject(memDC, g_hFontNormal);
         SetTextColor(memDC, CLR_TEXT_DIM);
         SetBkMode(memDC, TRANSPARENT);
-        TextOutA(memDC, 290, 652, "Duration:", 9);
+        TextOutA(memDC, 290, 712, "Duration:", 9);
 
-        // Change HWID button (owner-drawn)
-        RECT rcChange = {20, 668, 265, 708};
+        RECT rcChange = {20, 730, 265, 765};
         DrawButton(memDC, &rcChange, g_SpooferLoaded ? "Randomize Again" : "Change HWID",
                    CLR_BTN_CHANGE, g_HoverChange);
 
-        // Revert button
-        RECT rcRevert = {20, 720, 265, 755};
+        RECT rcRevert = {20, 775, 265, 808};
         DrawButton(memDC, &rcRevert, "Revert to Original", CLR_BTN_REVERT, g_HoverRevert);
 
-        // Refresh button area
-        SelectObject(memDC, g_hFontSmall);
-        SetTextColor(memDC, CLR_ACCENT);
         {
-            RECT rcRefresh = {290, 720, 490, 755};
+            RECT rcRefresh = {290, 775, 490, 808};
             HBRUSH brRef = CreateSolidBrush(CLR_PANEL);
             HPEN penRef = CreatePen(PS_SOLID, 1, CLR_BORDER);
             SelectObject(memDC, brRef);
@@ -661,18 +645,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int mx = LOWORD(lParam);
         int my = HIWORD(lParam);
 
-        // Change HWID button hit test
-        if (mx >= 20 && mx <= 265 && my >= 668 && my <= 708) {
+        if (mx >= 20 && mx <= 265 && my >= 730 && my <= 765) {
             DoSpoofHWID();
             InvalidateRect(hWnd, NULL, TRUE);
         }
-        // Revert button hit test
-        else if (mx >= 20 && mx <= 265 && my >= 720 && my <= 755) {
+        else if (mx >= 20 && mx <= 265 && my >= 775 && my <= 808) {
             DoRevertHWID();
             InvalidateRect(hWnd, NULL, TRUE);
         }
-        // Refresh button hit test
-        else if (mx >= 290 && mx <= 490 && my >= 720 && my <= 755) {
+        else if (mx >= 290 && mx <= 490 && my >= 775 && my <= 808) {
             RefreshCurrentHWIDs();
             InvalidateRect(hWnd, NULL, TRUE);
         }
@@ -682,8 +663,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_MOUSEMOVE: {
         int mx = LOWORD(lParam);
         int my = HIWORD(lParam);
-        BOOL newHoverC = (mx >= 20 && mx <= 265 && my >= 668 && my <= 708);
-        BOOL newHoverR = (mx >= 20 && mx <= 265 && my >= 720 && my <= 755);
+        BOOL newHoverC = (mx >= 20 && mx <= 265 && my >= 730 && my <= 765);
+        BOOL newHoverR = (mx >= 20 && mx <= 265 && my >= 775 && my <= 808);
         if (newHoverC != g_HoverChange || newHoverR != g_HoverRevert) {
             g_HoverChange = newHoverC;
             g_HoverRevert = newHoverR;
@@ -746,35 +727,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // ==================== HWID READING ====================
 
 BOOL GetDiskSerial(char* buffer, size_t bufferSize) {
-    FILE* fp = _popen("wmic diskdrive get serialnumber 2>nul", "r");
-    if (!fp) return FALSE;
+    typedef struct {
+        DWORD PropertyId;
+        DWORD QueryType;
+        BYTE  AdditionalParameters[1];
+    } STOR_PROP_QUERY;
 
-    char line[256];
-    int lineNum = 0;
-    BOOL found = FALSE;
+    typedef struct {
+        DWORD Version;
+        DWORD Size;
+        BYTE  DeviceType;
+        BYTE  DeviceTypeModifier;
+        BOOLEAN RemovableMedia;
+        BOOLEAN CommandQueueing;
+        DWORD VendorIdOffset;
+        DWORD ProductIdOffset;
+        DWORD ProductRevisionOffset;
+        DWORD SerialNumberOffset;
+        DWORD BusType;
+        DWORD RawPropertiesLength;
+        BYTE  RawDeviceProperties[1];
+    } STOR_DEV_DESC;
 
-    while (fgets(line, sizeof(line), fp)) {
-        lineNum++;
-        if (lineNum > 1) {
-            char* start = line;
-            while (*start && (*start == ' ' || *start == '\t')) start++;
-            if (*start && *start != '\n' && *start != '\r') {
-                char* end = start + strlen(start) - 1;
-                while (end > start && (*end == ' ' || *end == '\t' ||
-                       *end == '\n' || *end == '\r')) {
-                    *end = '\0';
-                    end--;
-                }
-                if (*start) {
-                    strncpy_s(buffer, bufferSize, start, _TRUNCATE);
-                    found = TRUE;
-                    break;
-                }
-            }
+    HANDLE hDevice = CreateFileA("\\\\.\\PhysicalDrive0", 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hDevice == INVALID_HANDLE_VALUE) return FALSE;
+
+    STOR_PROP_QUERY query = {0};
+    BYTE outBuf[1024] = {0};
+    DWORD bytesReturned = 0;
+
+    BOOL result = DeviceIoControl(hDevice, 0x002D1400,
+        &query, sizeof(query), outBuf, sizeof(outBuf), &bytesReturned, NULL);
+    CloseHandle(hDevice);
+
+    if (!result || bytesReturned < sizeof(STOR_DEV_DESC)) return FALSE;
+
+    STOR_DEV_DESC* desc = (STOR_DEV_DESC*)outBuf;
+    if (desc->SerialNumberOffset > 0 && desc->SerialNumberOffset < bytesReturned) {
+        char* serial = (char*)(outBuf + desc->SerialNumberOffset);
+        while (*serial == ' ') serial++;
+        size_t len = strlen(serial);
+        while (len > 0 && serial[len - 1] == ' ') { serial[--len] = '\0'; }
+        if (*serial) {
+            strncpy_s(buffer, bufferSize, serial, _TRUNCATE);
+            return TRUE;
         }
     }
-    _pclose(fp);
-    return found;
+    return FALSE;
 }
 
 BOOL GetMACAddress(UCHAR* mac) {
@@ -804,16 +804,140 @@ BOOL GetMACAddress(UCHAR* mac) {
     return found;
 }
 
+BOOL GetBIOSSerial(char* buffer, size_t bufferSize) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+    DWORD size = (DWORD)bufferSize;
+    DWORD type = 0;
+    LSTATUS res = RegQueryValueExA(hKey, "SystemSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
+    RegCloseKey(hKey);
+    return (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0');
+}
+
+BOOL GetBoardSerial(char* buffer, size_t bufferSize) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+    DWORD size = (DWORD)bufferSize;
+    DWORD type = 0;
+    LSTATUS res = RegQueryValueExA(hKey, "BaseBoardSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
+    RegCloseKey(hKey);
+    return (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0');
+}
+
+BOOL GetSystemUUID(char* buffer, size_t bufferSize) {
+    typedef struct {
+        BYTE  Used20CallingMethod;
+        BYTE  SMBIOSMajorVersion;
+        BYTE  SMBIOSMinorVersion;
+        BYTE  DmiRevision;
+        DWORD Length;
+    } RAW_SMBIOS_HDR;
+
+    DWORD size = GetSystemFirmwareTable('RSMB', 0, NULL, 0);
+    if (size == 0) return FALSE;
+
+    BYTE* data = (BYTE*)malloc(size);
+    if (!data) return FALSE;
+
+    if (GetSystemFirmwareTable('RSMB', 0, data, size) != size) {
+        free(data);
+        return FALSE;
+    }
+
+    RAW_SMBIOS_HDR* hdr = (RAW_SMBIOS_HDR*)data;
+    BYTE* tbl = data + sizeof(RAW_SMBIOS_HDR);
+    BYTE* tblEnd = tbl + hdr->Length;
+    BYTE* ptr = tbl;
+
+    while (ptr + 4 < tblEnd) {
+        BYTE type = ptr[0];
+        BYTE length = ptr[1];
+        if (length < 4) break;
+
+        if (type == 1 && length >= 0x19) {
+            BYTE* uuid = ptr + 0x08;
+            sprintf_s(buffer, bufferSize,
+                "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                uuid[3], uuid[2], uuid[1], uuid[0],
+                uuid[5], uuid[4],
+                uuid[7], uuid[6],
+                uuid[8], uuid[9],
+                uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+            free(data);
+            return TRUE;
+        }
+
+        ptr += length;
+        while (ptr < tblEnd - 1 && !(ptr[0] == 0 && ptr[1] == 0)) ptr++;
+        ptr += 2;
+    }
+
+    free(data);
+    return FALSE;
+}
+
+BOOL GetVolumeSerialNum(ULONG* serial) {
+    DWORD volSerial = 0;
+    if (GetVolumeInformationA("C:\\", NULL, 0, &volSerial, NULL, NULL, NULL, 0)) {
+        *serial = volSerial;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+BOOL GetGPUID(char* buffer, size_t bufferSize) {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            "{4d36e968-e325-11ce-bfc1-08002be10318}\\0000",
+            0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return FALSE;
+    DWORD size = (DWORD)bufferSize;
+    DWORD type = 0;
+    LSTATUS res = RegQueryValueExA(hKey, "HardwareInformation.AdapterString",
+        NULL, &type, (LPBYTE)buffer, &size);
+    if (res == ERROR_SUCCESS && buffer[0] != '\0') {
+        RegCloseKey(hKey);
+        return TRUE;
+    }
+    size = (DWORD)bufferSize;
+    res = RegQueryValueExA(hKey, "DriverDesc", NULL, &type, (LPBYTE)buffer, &size);
+    RegCloseKey(hKey);
+    return (res == ERROR_SUCCESS && buffer[0] != '\0');
+}
+
 void ReadAllHWIDs() {
     if (!GetDiskSerial(g_OriginalDiskSerial, sizeof(g_OriginalDiskSerial)))
         strcpy_s(g_OriginalDiskSerial, sizeof(g_OriginalDiskSerial), "(failed to read)");
     g_OriginalMACValid = GetMACAddress(g_OriginalMAC);
+    if (!GetBIOSSerial(g_OrigBIOSSerial, sizeof(g_OrigBIOSSerial)))
+        strcpy_s(g_OrigBIOSSerial, sizeof(g_OrigBIOSSerial), "(not available)");
+    if (!GetBoardSerial(g_OrigBoardSerial, sizeof(g_OrigBoardSerial)))
+        strcpy_s(g_OrigBoardSerial, sizeof(g_OrigBoardSerial), "(not available)");
+    if (!GetSystemUUID(g_OrigSystemUUID, sizeof(g_OrigSystemUUID)))
+        strcpy_s(g_OrigSystemUUID, sizeof(g_OrigSystemUUID), "(not available)");
+    g_OrigVolumeSerialValid = GetVolumeSerialNum(&g_OrigVolumeSerial);
+    if (!GetGPUID(g_OrigGPUID, sizeof(g_OrigGPUID)))
+        strcpy_s(g_OrigGPUID, sizeof(g_OrigGPUID), "(not available)");
 }
 
 void RefreshCurrentHWIDs() {
     if (!GetDiskSerial(g_CurrentDiskSerial, sizeof(g_CurrentDiskSerial)))
         strcpy_s(g_CurrentDiskSerial, sizeof(g_CurrentDiskSerial), "(failed to read)");
     g_CurrentMACValid = GetMACAddress(g_CurrentMAC);
+    if (!GetBIOSSerial(g_CurrBIOSSerial, sizeof(g_CurrBIOSSerial)))
+        strcpy_s(g_CurrBIOSSerial, sizeof(g_CurrBIOSSerial), "(not available)");
+    if (!GetBoardSerial(g_CurrBoardSerial, sizeof(g_CurrBoardSerial)))
+        strcpy_s(g_CurrBoardSerial, sizeof(g_CurrBoardSerial), "(not available)");
+    if (!GetSystemUUID(g_CurrSystemUUID, sizeof(g_CurrSystemUUID)))
+        strcpy_s(g_CurrSystemUUID, sizeof(g_CurrSystemUUID), "(not available)");
+    g_CurrVolumeSerialValid = GetVolumeSerialNum(&g_CurrVolumeSerial);
+    if (!GetGPUID(g_CurrGPUID, sizeof(g_CurrGPUID)))
+        strcpy_s(g_CurrGPUID, sizeof(g_CurrGPUID), "(not available)");
 }
 
 // ==================== HWID LOG ====================
@@ -1165,7 +1289,7 @@ BOOL LoadVulnerableDriver() {
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
 
-    // Driver is now loaded in kernel — immediately wipe the file from disk
+    // Driver is now loaded in kernel â€” immediately wipe the file from disk
     SecureWipeFile(g_VulnDriverPath);
 
     g_hVulnDriver = CreateFileA(g_VulnDeviceName, GENERIC_READ | GENERIC_WRITE,
@@ -1576,3 +1700,4 @@ BOOL IsAdmin() {
     }
     return isAdmin;
 }
+

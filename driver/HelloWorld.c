@@ -292,9 +292,8 @@ static VOID GenAllIDs() {
 
     g_VS = perf.LowPart ^ perf2.HighPart ^ 0xABCD1234;
 
-    // GPU adapter string NOT spoofed - model name is shared by millions
-    // and a fake string like "GPU-7A3F21D8" is an instant red flag
-    g_GP[0] = '\0';
+    RtlStringCbCopyA(g_GP, sizeof(g_GP), "GPU-");
+    RandHex(g_GP + 4, 13);
 }
 
 // ==================== LOG ====================
@@ -565,6 +564,30 @@ NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
 
 // ==================== REGISTRY SPOOFING ====================
 
+static VOID RegReadStr(HANDLE hk, PCWSTR name, PCHAR dst, SIZE_T dstSz) {
+    UNICODE_STRING vn;
+    RtlInitUnicodeString(&vn, name);
+    UCHAR buf[512];
+    ULONG len = 0;
+    NTSTATUS st = ZwQueryValueKey(hk, &vn, KeyValuePartialInformation, buf, sizeof(buf), &len);
+    if (NT_SUCCESS(st)) {
+        PKEY_VALUE_PARTIAL_INFORMATION kv = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        if (kv->Type == REG_SZ && kv->DataLength > sizeof(WCHAR)) {
+            UNICODE_STRING us;
+            us.Buffer = (PWCH)kv->Data;
+            us.Length = (USHORT)(kv->DataLength - sizeof(WCHAR));
+            us.MaximumLength = (USHORT)kv->DataLength;
+            ANSI_STRING as;
+            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&as, &us, TRUE))) {
+                SIZE_T copyLen = (SIZE_T)as.Length < dstSz - 1 ? (SIZE_T)as.Length : dstSz - 1;
+                RtlCopyMemory(dst, as.Buffer, copyLen);
+                dst[copyLen] = '\0';
+                RtlFreeAnsiString(&as);
+            }
+        }
+    }
+}
+
 static VOID RegSetStr(HANDLE hk, PCWSTR name, PCHAR val) {
     UNICODE_STRING vn; ANSI_STRING av; UNICODE_STRING uv;
     RtlInitUnicodeString(&vn, name);
@@ -580,8 +603,12 @@ static VOID SpoofRegistry() {
 
     RtlInitUnicodeString(&kp, L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\BIOS");
     InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
+    st = ZwOpenKey(&hk, KEY_SET_VALUE | KEY_QUERY_VALUE, &oa);
     if (NT_SUCCESS(st)) {
+        if (!g_Logged) {
+            RegReadStr(hk, L"SystemSerialNumber", g_Log.OBs, 64);
+            RegReadStr(hk, L"BaseBoardSerialNumber", g_Log.OMs, 64);
+        }
         RegSetStr(hk, L"SystemSerialNumber", g_BS);
         RegSetStr(hk, L"BaseBoardSerialNumber", g_MB);
         RegSetStr(hk, L"BIOSVersion", g_FR);
@@ -592,10 +619,12 @@ static VOID SpoofRegistry() {
     RtlInitUnicodeString(&kp,
         L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0000");
     InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
+    st = ZwOpenKey(&hk, KEY_SET_VALUE | KEY_QUERY_VALUE, &oa);
     if (NT_SUCCESS(st)) {
-        // GPU adapter string intentionally NOT spoofed
-        // Fake GPU names are a detection vector, real model is not unique
+        if (!g_Logged) {
+            RegReadStr(hk, L"HardwareInformation.AdapterString", g_Log.OGp, 64);
+        }
+        RegSetStr(hk, L"HardwareInformation.AdapterString", g_GP);
         ZwClose(hk);
     }
 }
@@ -634,3 +663,4 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     return STATUS_SUCCESS;
 }
+
