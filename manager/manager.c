@@ -1125,15 +1125,7 @@ void DoSpoofHWID() {
         }
     }
 
-    // Load driver
     if (!LoadSpooferDriver()) {
-        MessageBoxA(g_hWnd,
-            "Failed to load spoofer driver.\n\n"
-            "Possible causes:\n"
-            "- Test signing not enabled\n"
-            "- Memory Integrity (HVCI) is on\n"
-            "- Secure Boot blocking unsigned drivers",
-            "Driver Error", MB_ICONERROR);
         UpdateStatus();
         return;
     }
@@ -1341,7 +1333,7 @@ BOOL LoadVulnerableDriver() {
     g_hVulnDriver = CreateFileA(g_VulnDeviceName, GENERIC_READ | GENERIC_WRITE,
         0, NULL, OPEN_EXISTING, 0, NULL);
 
-    return TRUE;
+    return (g_hVulnDriver != INVALID_HANDLE_VALUE);
 }
 
 VOID UnloadVulnerableDriver() {
@@ -1674,33 +1666,58 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
 // ==================== DRIVER MANAGEMENT ====================
 
 BOOL LoadSpooferDriver() {
-    if (!LoadVulnerableDriver()) return FALSE;
+    if (!LoadVulnerableDriver()) {
+        DWORD err = GetLastError();
+        char msg[256];
+        sprintf_s(msg, sizeof(msg),
+            "Stage 1 failed: vulnerable driver won't load.\n"
+            "Error code: %lu\n\n"
+            "- Disable Memory Integrity in Windows Security\n"
+            "- Disable Vulnerable Driver Blocklist (registry)\n"
+            "- Reboot after changing settings", err);
+        MessageBoxA(g_hWnd, msg, "Driver Error - Stage 1", MB_ICONERROR);
+        return FALSE;
+    }
 
     g_KernelBase = KM_GetKernelBase();
     if (!g_KernelBase) {
+        MessageBoxA(g_hWnd, "Stage 2 failed: cannot locate kernel base address.",
+            "Driver Error - Stage 2", MB_ICONERROR);
         UnloadVulnerableDriver();
         return FALSE;
     }
 
     HRSRC hRes = FindResourceA(g_hInst, MAKEINTRESOURCEA(IDR_SPOOFER_SYS), RT_RCDATA);
-    if (!hRes) { UnloadVulnerableDriver(); return FALSE; }
+    if (!hRes) {
+        MessageBoxA(g_hWnd, "Stage 3 failed: spoofer driver resource not found in EXE.",
+            "Driver Error - Stage 3", MB_ICONERROR);
+        UnloadVulnerableDriver();
+        return FALSE;
+    }
 
     HGLOBAL hData = LoadResource(g_hInst, hRes);
-    if (!hData) { UnloadVulnerableDriver(); return FALSE; }
-
     DWORD resSize = SizeofResource(g_hInst, hRes);
-    PVOID resData = LockResource(hData);
-    if (!resData || resSize == 0) { UnloadVulnerableDriver(); return FALSE; }
+    PVOID resData = hData ? LockResource(hData) : NULL;
+    if (!resData || resSize == 0) {
+        MessageBoxA(g_hWnd, "Stage 3 failed: cannot read spoofer driver resource.",
+            "Driver Error - Stage 3", MB_ICONERROR);
+        UnloadVulnerableDriver();
+        return FALSE;
+    }
 
     if (!KM_MapDriverFromMemory(resData, resSize)) {
+        MessageBoxA(g_hWnd, "Stage 4 failed: kernel driver mapping failed.\n\n"
+            "Possible causes:\n"
+            "- Kernel pool allocation failed\n"
+            "- Import resolution failed\n"
+            "- DriverEntry returned error",
+            "Driver Error - Stage 4", MB_ICONERROR);
         UnloadVulnerableDriver();
         return FALSE;
     }
 
     UnloadVulnerableDriver();
-
     RemoveDirectoryA(g_TempDir);
-
     return TRUE;
 }
 
