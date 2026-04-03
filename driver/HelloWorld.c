@@ -12,6 +12,13 @@ extern NTSTATUS NTAPI ObReferenceObjectByName(
     ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode,
     PVOID ParseContext, PVOID *Object);
 
+NTSYSCALLAPI NTSTATUS NTAPI ZwQuerySystemInformation(
+    ULONG SystemInformationClass, PVOID SystemInformation,
+    ULONG SystemInformationLength, PULONG ReturnLength);
+NTSYSCALLAPI NTSTATUS NTAPI ZwSetSystemInformation(
+    ULONG SystemInformationClass, PVOID SystemInformation,
+    ULONG SystemInformationLength);
+
 // ==================== CONSTANTS (obfuscated at compile) ====================
 
 #define IO_SMART         0x7C088
@@ -475,14 +482,14 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
     ULONG code = sp->Parameters.DeviceIoControl.IoControlCode;
 
     if (code == IOCTL_STORAGE_QUERY_PROPERTY) {
+        PVOID b = irp->AssociatedIrp.SystemBuffer;
+        ULONG savedPropId = (ULONG)-1;
+        if (b) savedPropId = ((PSTORAGE_PROPERTY_QUERY)b)->PropertyId;
+
         NTSTATUS st = CallOrig(&g_hDisk, dev, irp, HkDisk);
-        if (NT_SUCCESS(st) && irp->IoStatus.Information > sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
-            PVOID b = irp->AssociatedIrp.SystemBuffer;
-            if (b) {
-                PSTORAGE_PROPERTY_QUERY q = (PSTORAGE_PROPERTY_QUERY)b;
-                if (q->PropertyId == StorageDeviceProperty)
-                    SpoofStorageQP(b, irp->IoStatus.Information);
-            }
+        if (NT_SUCCESS(st) && savedPropId == StorageDeviceProperty &&
+            irp->IoStatus.Information > sizeof(STORAGE_DEVICE_DESCRIPTOR) && b) {
+            SpoofStorageQP(b, irp->IoStatus.Information);
         }
         return st;
     }
@@ -654,6 +661,38 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     // Hook NTFS for volume serial
     fn = FindDispatch(L"\\FileSystem\\Ntfs", IRP_MJ_QUERY_VOLUME_INFORMATION);
     if (fn) HookInstall(fn, HkFs, &g_hFs);
+
+    // Patch SMBIOS tables (UUID, BIOS/board/chassis serials)
+    {
+        typedef struct {
+            ULONG Action;       // 1 = query
+            ULONG DataLength;
+            ULONG TableProvSig; // 'RSMB'
+            ULONG TableId;
+            UCHAR TableBuffer[1];
+        } SYSTEM_FIRMWARE_TABLE_INFO;
+
+        ULONG needed = 0;
+        SYSTEM_FIRMWARE_TABLE_INFO probe = {0};
+        probe.Action = 1;
+        probe.TableProvSig = 'RSMB';
+        NTSTATUS st = ZwQuerySystemInformation(76, &probe, sizeof(probe), &needed);
+        if (needed > 0) {
+            SYSTEM_FIRMWARE_TABLE_INFO* fi =
+                (SYSTEM_FIRMWARE_TABLE_INFO*)ExAllocatePoolWithTag(NonPagedPool, needed, 'bmsR');
+            if (fi) {
+                RtlZeroMemory(fi, needed);
+                fi->Action = 1;
+                fi->TableProvSig = 'RSMB';
+                st = ZwQuerySystemInformation(76, fi, needed, &needed);
+                if (NT_SUCCESS(st) && fi->DataLength > 0) {
+                    SpoofSMBIOS(fi->TableBuffer, fi->DataLength);
+                    ZwSetSystemInformation(76, fi, needed);
+                }
+                ExFreePoolWithTag(fi, 'bmsR');
+            }
+        }
+    }
 
     // Direct registry spoofing
     SpoofRegistry();
