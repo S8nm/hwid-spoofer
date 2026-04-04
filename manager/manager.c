@@ -243,6 +243,11 @@ VOID KM_UnmapPhysicalMemory(PVOID virtAddr, SIZE_T size);
 BOOL KM_CopyKernelMemory(ULONG64 dest, ULONG64 src, SIZE_T size);
 BOOL KM_ReadKernelMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size);
 BOOL KM_WriteKernelMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size);
+BOOL KM_ReadPhysicalAddress(ULONG64 physAddr, PVOID buffer, SIZE_T size);
+BOOL KM_WritePhysicalAddress(ULONG64 physAddr, PVOID buffer, SIZE_T size);
+ULONG64 KM_TranslateLinearAddress(ULONG64 dirBase, ULONG64 virtualAddr);
+ULONG64 KM_GetDirectoryTableBase();
+BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size);
 PVOID KM_GetKernelExport(const char* name);
 BOOL KM_ProcessRelocations(PVOID imageBase, PVOID mappedBase, SIZE_T imageSize);
 BOOL KM_ResolveImports(PVOID imageBase);
@@ -1426,6 +1431,93 @@ BOOL KM_WriteKernelMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     return KM_CopyKernelMemory(kernelAddr, (ULONG64)buffer, size);
 }
 
+BOOL KM_ReadPhysicalAddress(ULONG64 physAddr, PVOID buffer, SIZE_T size) {
+    ULONG64 pageBase = physAddr & ~0xFFFULL;
+    ULONG64 pageOffset = physAddr & 0xFFF;
+
+    if (pageOffset + size > 0x1000) return FALSE;
+
+    PVOID mapped = KM_MapPhysicalMemory(pageBase, 0x1000);
+    if (!mapped) return FALSE;
+
+    BOOL ok = KM_CopyKernelMemory((ULONG64)buffer, (ULONG64)mapped + pageOffset, size);
+    KM_UnmapPhysicalMemory(mapped, 0x1000);
+    return ok;
+}
+
+BOOL KM_WritePhysicalAddress(ULONG64 physAddr, PVOID buffer, SIZE_T size) {
+    ULONG64 pageBase = physAddr & ~0xFFFULL;
+    ULONG64 pageOffset = physAddr & 0xFFF;
+
+    if (pageOffset + size > 0x1000) return FALSE;
+
+    PVOID mapped = KM_MapPhysicalMemory(pageBase, 0x1000);
+    if (!mapped) return FALSE;
+
+    BOOL ok = KM_CopyKernelMemory((ULONG64)mapped + pageOffset, (ULONG64)buffer, size);
+    KM_UnmapPhysicalMemory(mapped, 0x1000);
+    return ok;
+}
+
+ULONG64 KM_TranslateLinearAddress(ULONG64 dirBase, ULONG64 virtualAddr) {
+    USHORT pml4Idx  = (USHORT)((virtualAddr >> 39) & 0x1FF);
+    USHORT pdptIdx  = (USHORT)((virtualAddr >> 30) & 0x1FF);
+    USHORT pdIdx    = (USHORT)((virtualAddr >> 21) & 0x1FF);
+    USHORT ptIdx    = (USHORT)((virtualAddr >> 12) & 0x1FF);
+
+    ULONG64 pml4e = 0;
+    if (!KM_ReadPhysicalAddress(dirBase + pml4Idx * 8, &pml4e, sizeof(pml4e)))
+        return 0;
+    if (!(pml4e & 1)) return 0;
+
+    ULONG64 pdpte = 0;
+    if (!KM_ReadPhysicalAddress((pml4e & 0xFFFFFFFFFF000ULL) + pdptIdx * 8, &pdpte, sizeof(pdpte)))
+        return 0;
+    if (!(pdpte & 1)) return 0;
+    if (pdpte & 0x80)
+        return (pdpte & 0xFFFFC0000000ULL) + (virtualAddr & 0x3FFFFFFFULL);
+
+    ULONG64 pde = 0;
+    if (!KM_ReadPhysicalAddress((pdpte & 0xFFFFFFFFFF000ULL) + pdIdx * 8, &pde, sizeof(pde)))
+        return 0;
+    if (!(pde & 1)) return 0;
+    if (pde & 0x80)
+        return (pde & 0xFFFFFE00000ULL) + (virtualAddr & 0x1FFFFFULL);
+
+    ULONG64 pte = 0;
+    if (!KM_ReadPhysicalAddress((pde & 0xFFFFFFFFFF000ULL) + ptIdx * 8, &pte, sizeof(pte)))
+        return 0;
+    if (!(pte & 1)) return 0;
+
+    return (pte & 0xFFFFFFFFFF000ULL) + (virtualAddr & 0xFFFULL);
+}
+
+ULONG64 KM_GetDirectoryTableBase() {
+    PVOID pInitProc = KM_GetKernelExport("PsInitialSystemProcess");
+    if (!pInitProc) return 0;
+
+    ULONG64 eprocess = 0;
+    if (!KM_ReadKernelMemory((ULONG64)pInitProc, &eprocess, sizeof(eprocess)))
+        return 0;
+    if (!eprocess) return 0;
+
+    ULONG64 dirBase = 0;
+    if (!KM_ReadKernelMemory(eprocess + 0x28, &dirBase, sizeof(dirBase)))
+        return 0;
+
+    return dirBase;
+}
+
+BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
+    ULONG64 dirBase = KM_GetDirectoryTableBase();
+    if (!dirBase) return FALSE;
+
+    ULONG64 physAddr = KM_TranslateLinearAddress(dirBase, kernelAddr);
+    if (!physAddr) return FALSE;
+
+    return KM_WritePhysicalAddress(physAddr, buffer, size);
+}
+
 PVOID KM_GetKernelExport(const char* name) {
     HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
     if (!kernel) return NULL;
@@ -1565,12 +1657,12 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     ULONG64 resultAddr = codeCave + 80;
 
     ULONG64 zero = 0;
-    KM_WriteKernelMemory(resultAddr, &zero, sizeof(zero));
+    KM_WriteToReadOnlyMemory(resultAddr, &zero, sizeof(zero));
 
     unsigned char sc[] = {
         0x53,                                           // push rbx
         0x48, 0x83, 0xEC, 0x20,                        // sub rsp, 0x20
-        0x48, 0x31, 0xC9,                              // xor rcx, rcx  (NonPagedPool=0, which IS executable)
+        0x48, 0x31, 0xC9,                              // xor rcx, rcx  (NonPagedPool=0, executable)
         0x48, 0xBA,                                     // mov rdx, imm64 (size)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x49, 0xB8,                                     // mov r8, imm64 (tag)
@@ -1592,7 +1684,8 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     *(ULONG64*)(sc + 30) = (ULONG64)pExAllocatePool;
     *(ULONG64*)(sc + 42) = resultAddr;
 
-    KM_WriteKernelMemory(codeCave, sc, sizeof(sc));
+    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc)))
+        return 0;
 
     if (!KM_ExecuteInKernel(codeCave))
         return 0;
@@ -1609,7 +1702,7 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
 
     ULONG64 resultAddr = codeCave + 80;
     ULONG64 zero = 0;
-    KM_WriteKernelMemory(resultAddr, &zero, sizeof(zero));
+    KM_WriteToReadOnlyMemory(resultAddr, &zero, sizeof(zero));
 
     unsigned char sc[] = {
         0x53,                                           // push rbx
@@ -1631,7 +1724,8 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
     *(ULONG64*)(sc + 13) = entryAddr;
     *(ULONG64*)(sc + 25) = resultAddr;
 
-    KM_WriteKernelMemory(codeCave, sc, sizeof(sc));
+    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc)))
+        return FALSE;
 
     if (!KM_ExecuteInKernel(codeCave))
         return FALSE;
