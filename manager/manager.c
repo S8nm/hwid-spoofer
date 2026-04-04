@@ -144,8 +144,8 @@ static CHAR g_VulnDeviceName[64] = {0};
 typedef struct {
     ULONG64 case_number;
     ULONG64 reserved;
+    ULONG64 return_status;
     ULONG64 return_ptr;
-    ULONG64 return_size;
     ULONG64 phys_addr;
     ULONG64 size;
 } MAP_IO_SPACE_BUFFER;
@@ -161,9 +161,9 @@ typedef struct {
 typedef struct {
     ULONG64 case_number;
     ULONG64 reserved;
+    ULONG64 reserved2;
     ULONG64 virt_addr;
-    ULONG64 unused1;
-    ULONG64 phys_addr;
+    ULONG64 reserved3;
     ULONG64 size;
 } UNMAP_IO_SPACE_BUFFER;
 
@@ -1422,8 +1422,8 @@ PVOID KM_MapPhysicalMemory(ULONG64 physAddr, SIZE_T size) {
     DWORD returned = 0;
     BOOL ok = DeviceIoControl(g_hVulnDriver, IOCTL_NAL_MAP,
         &input, sizeof(input), &input, sizeof(input), &returned, NULL);
-    DbgLog("    MapPhys: PA=0x%llX size=%llu -> VA=0x%llX (ioctl=%s, err=%lu)",
-        physAddr, (ULONG64)size, (ULONG64)input.return_ptr,
+    DbgLog("    MapPhys: PA=0x%llX size=%llu -> status=0x%llX VA=0x%llX (ioctl=%s, err=%lu)",
+        physAddr, (ULONG64)size, input.return_status, (ULONG64)input.return_ptr,
         ok ? "OK" : "FAIL", GetLastError());
     return (PVOID)input.return_ptr;
 }
