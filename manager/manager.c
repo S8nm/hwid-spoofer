@@ -883,6 +883,32 @@ static BOOL GetSMBIOSString(BYTE smbType, BYTE strOffset, char* buffer, size_t b
     return found;
 }
 
+/* OEMs often leave placeholder text in the registry; treat as missing so SMBIOS can supply a real value. */
+static BOOL IsPlaceholderSerial(const char* s) {
+    static const char* bad[] = {
+        "System Serial Number",
+        "Base Board Serial Number",
+        "Default string",
+        "Default String",
+        "To be filled by O.E.M.",
+        "To Be Filled By O.E.M.",
+        "O.E.M.",
+        "NONE",
+        "None",
+        "Not Specified",
+        "Not Applicable",
+        "INVALID",
+        "N/A",
+        "0",
+    };
+    size_t i;
+    if (!s || !s[0]) return TRUE;
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        if (_stricmp(s, bad[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
 BOOL GetBIOSSerial(char* buffer, size_t bufferSize) {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
@@ -891,10 +917,13 @@ BOOL GetBIOSSerial(char* buffer, size_t bufferSize) {
         DWORD type = 0;
         LSTATUS res = RegQueryValueExA(hKey, "SystemSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
         RegCloseKey(hKey);
-        if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0')
+        if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0' && !IsPlaceholderSerial(buffer))
             return TRUE;
     }
-    return GetSMBIOSString(1, 0x07, buffer, bufferSize);
+    if (GetSMBIOSString(1, 0x07, buffer, bufferSize) && !IsPlaceholderSerial(buffer))
+        return TRUE;
+    buffer[0] = '\0';
+    return FALSE;
 }
 
 BOOL GetBoardSerial(char* buffer, size_t bufferSize) {
@@ -905,10 +934,13 @@ BOOL GetBoardSerial(char* buffer, size_t bufferSize) {
         DWORD type = 0;
         LSTATUS res = RegQueryValueExA(hKey, "BaseBoardSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
         RegCloseKey(hKey);
-        if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0')
+        if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0' && !IsPlaceholderSerial(buffer))
             return TRUE;
     }
-    return GetSMBIOSString(2, 0x07, buffer, bufferSize);
+    if (GetSMBIOSString(2, 0x07, buffer, bufferSize) && !IsPlaceholderSerial(buffer))
+        return TRUE;
+    buffer[0] = '\0';
+    return FALSE;
 }
 
 BOOL GetSystemUUID(char* buffer, size_t bufferSize) {
@@ -1627,10 +1659,116 @@ static ULONG64 KM_GetVerifiedDirectoryTableBase(void) {
             return dir;
     }
 
-    ULONG64 fb = 0;
-    if (KM_ReadKernelMemory(eprocess + 0x28, &fb, sizeof(fb)) && fb)
-        return fb;
     return 0;
+}
+
+static BOOL KM_IsCanonicalKernelVa(ULONG64 va) {
+    return (va >= 0xFFFF800000000000ULL && va <= 0xFFFFFFFFFFFFFFFFULL);
+}
+
+/*
+ * Find PTE_BASE by scanning self-reference PML4 indices (256..511). Anchored at the
+ * classic Win7 reference index 0x1ED -> 0xFFFFF68000000000 (see Windows self-map layout).
+ */
+static ULONG64 KM_FindPteBaseForSystem(void) {
+    ULONG64 kbase = (ULONG64)g_KernelBase;
+    ULONG idx;
+
+    for (idx = 256; idx < 512; idx++) {
+        ULONG64 pteBase = 0xFFFFF68000000000ULL +
+            (((LONG64)(ULONG64)idx - (LONG64)0x1ED) << 39);
+        ULONG64 pteAddr = pteBase + (((LONG64)kbase >> 9) & 0x7FFFFFFFF8);
+        ULONG64 pteVal = 0;
+        ULONG64 pteAddr2;
+        ULONG64 pteVal2 = 0;
+        ULONG64 pfn1;
+        ULONG64 pfn2;
+
+        if (!KM_IsCanonicalKernelVa(pteAddr))
+            continue;
+        if (!KM_ReadKernelMemory(pteAddr, &pteVal, sizeof(pteVal)))
+            continue;
+        if (!(pteVal & 1))
+            continue;
+
+        pteAddr2 = pteBase + (((LONG64)(kbase + 0x1000) >> 9) & 0x7FFFFFFFF8);
+        if (!KM_ReadKernelMemory(pteAddr2, &pteVal2, sizeof(pteVal2)))
+            continue;
+        if (!(pteVal2 & 1))
+            continue;
+        pfn1 = (pteVal >> 12) & 0xFFFFFFFFFULL;
+        pfn2 = (pteVal2 >> 12) & 0xFFFFFFFFFULL;
+        if (pfn2 == pfn1 + 1)
+            return pteBase;
+    }
+    for (idx = 256; idx < 512; idx++) {
+        ULONG64 pteBase = 0xFFFFF68000000000ULL +
+            (((LONG64)(ULONG64)idx - (LONG64)0x1ED) << 39);
+        ULONG64 pteAddr = pteBase + (((LONG64)kbase >> 9) & 0x7FFFFFFFF8);
+        ULONG64 pteVal = 0;
+        if (!KM_IsCanonicalKernelVa(pteAddr))
+            continue;
+        if (!KM_ReadKernelMemory(pteAddr, &pteVal, sizeof(pteVal)))
+            continue;
+        if ((pteVal & 1) && ((pteVal >> 12) & 0xFFFFFFFFFULL) != 0)
+            return pteBase;
+    }
+    return 0;
+}
+
+/* PTE_BASE - 0x80000000 == PDE_BASE on NT-style x64 self-map (Vista+). Try PTE slot then PDE for large pages. */
+static BOOL KM_TryKernelVaWritableFlip(ULONG64 pteBase, ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
+    ULONG64 pteSlot = pteBase + (((LONG64)kernelAddr >> 9) & 0x7FFFFFFFF8);
+    ULONG64 pdeBase = pteBase - 0x80000000ULL;
+    ULONG64 pdeSlot = pdeBase + (((LONG64)kernelAddr >> 21) & 0x7FFFFFFFF8);
+    ULONG64 slots[2];
+    const char* names[2];
+    int si;
+
+    slots[0] = pteSlot;
+    names[0] = "PTE";
+    slots[1] = pdeSlot;
+    names[1] = "PDE";
+
+    for (si = 0; si < 2; si++) {
+        ULONG64 slot = slots[si];
+        ULONG64 old = 0;
+        ULONG64 newv;
+        BOOL ok;
+        BYTE v = 0;
+        BOOL vr;
+
+        if (!KM_IsCanonicalKernelVa(slot))
+            continue;
+        if (!KM_ReadKernelMemory(slot, &old, sizeof(old)))
+            continue;
+        if (!(old & 1))
+            continue;
+
+        newv = old | 0x2ULL;
+        if (newv == old) {
+            ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+            vr = KM_ReadKernelMemory(kernelAddr, &v, 1);
+            if (ok && vr && v == ((BYTE*)buffer)[0]) {
+                DbgLog("  WriteToReadOnly: kernel VA slot already R/W (%s 0x%llX)", names[si], slot);
+                return TRUE;
+            }
+            continue;
+        }
+
+        if (!KM_WriteKernelMemory(slot, &newv, sizeof(newv)))
+            continue;
+
+        ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+        vr = KM_ReadKernelMemory(kernelAddr, &v, 1);
+        KM_WriteKernelMemory(slot, &old, sizeof(old));
+
+        if (ok && vr && v == ((BYTE*)buffer)[0]) {
+            DbgLog("  WriteToReadOnly: kernel VA %s flip OK at 0x%llX", names[si], slot);
+            return TRUE;
+        }
+    }
+    return FALSE;
 }
 
 BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
@@ -1640,73 +1778,58 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     DbgLog("  WriteToReadOnly: VA=0x%llX, size=%llu", kernelAddr, (ULONG64)size);
 
     ULONG64 dirBase = KM_GetVerifiedDirectoryTableBase();
-    if (!dirBase) {
-        DbgLog("  WriteToReadOnly: no verified CR3; trying legacy direct IOCTL write...");
-        goto legacy_direct;
-    }
+    if (dirBase) {
+        ULONG64 ptePhys = KM_GetPageTableEntryPhysicalAddress(dirBase, kernelAddr);
+        if (ptePhys) {
+            DbgLog("  WriteToReadOnly: PTE/PDE slot PA=0x%llX (flip RW via physical map)", ptePhys);
 
-    ULONG64 ptePhys = KM_GetPageTableEntryPhysicalAddress(dirBase, kernelAddr);
-    if (!ptePhys) {
-        DbgLog("  WriteToReadOnly: could not resolve PTE/PDE physical address; trying legacy direct...");
-        goto legacy_direct;
-    }
+            ULONG64 oldEntry = 0;
+            if (KM_ReadPhysicalAddress(ptePhys, &oldEntry, sizeof(oldEntry))) {
+                ULONG64 newEntry = oldEntry | 0x2ULL;
+                BOOL flipped = (newEntry != oldEntry);
 
-    DbgLog("  WriteToReadOnly: PTE/PDE slot PA=0x%llX (flip RW via physical map)", ptePhys);
+                if (flipped) {
+                    if (KM_WritePhysicalAddress(ptePhys, &newEntry, sizeof(newEntry))) {
+                        BOOL ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+                        verify = 0;
+                        vr = KM_ReadKernelMemory(kernelAddr, &verify, 1);
+                        KM_WritePhysicalAddress(ptePhys, &oldEntry, sizeof(oldEntry));
+                        if (ok && vr && verify == ((BYTE*)buffer)[0]) {
+                            DbgLog("  WriteToReadOnly: physical PTE flip + IOCTL copy succeeded");
+                            return TRUE;
+                        }
+                        DbgLog("  WriteToReadOnly: physical flip wrote but verify failed (ok=%d vr=%d)", (int)ok, (int)vr);
+                    } else
+                        DbgLog("  WriteToReadOnly: physical flip write failed (MmMapIoSpace RAM?)");
+                } else {
+                    BOOL ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+                    verify = 0;
+                    vr = KM_ReadKernelMemory(kernelAddr, &verify, 1);
+                    if (ok && vr && verify == ((BYTE*)buffer)[0]) {
+                        DbgLog("  WriteToReadOnly: physical path slot already R/W");
+                        return TRUE;
+                    }
+                }
+            } else
+                DbgLog("  WriteToReadOnly: cannot read page table PA (MmMapIoSpace) — trying kernel VA PTE flip");
+        } else
+            DbgLog("  WriteToReadOnly: could not resolve PTE/PDE physical address — trying kernel VA PTE flip");
+    } else
+        DbgLog("  WriteToReadOnly: no verified CR3 from MZ test — trying kernel VA PTE flip");
 
-    ULONG64 oldEntry = 0;
-    if (!KM_ReadPhysicalAddress(ptePhys, &oldEntry, sizeof(oldEntry))) {
-        DbgLog("  WriteToReadOnly: cannot read page table (MmMapIoSpace). Refusing legacy direct write to avoid BSOD.");
-        return FALSE;
-    }
-
-    ULONG64 newEntry = oldEntry | 0x2ULL; /* Intel PTE/PDE R/W */
-    BOOL flipped = (newEntry != oldEntry);
-
-    if (flipped) {
-        if (!KM_WritePhysicalAddress(ptePhys, &newEntry, sizeof(newEntry))) {
-            DbgLog("  WriteToReadOnly: failed to set R/W bit on page table entry");
+    {
+        ULONG64 pteBase = KM_FindPteBaseForSystem();
+        if (!pteBase) {
+            DbgLog("  WriteToReadOnly FAIL: could not locate PTE_BASE (kernel VA scan)");
             return FALSE;
         }
+        DbgLog("  WriteToReadOnly: using PTE_BASE=0x%llX (kernel VA flip)", pteBase);
+        if (KM_TryKernelVaWritableFlip(pteBase, kernelAddr, buffer, size))
+            return TRUE;
     }
 
-    BOOL ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
-    verify = 0;
-    vr = KM_ReadKernelMemory(kernelAddr, &verify, 1);
-
-    if (flipped)
-        KM_WritePhysicalAddress(ptePhys, &oldEntry, sizeof(oldEntry));
-
-    if (!ok || !vr || verify != ((BYTE*)buffer)[0]) {
-        DbgLog("  WriteToReadOnly FAIL after PTE flip: ok=%d vr=%d verify=0x%02X expect=0x%02X",
-            (int)ok, (int)vr, verify, ((BYTE*)buffer)[0]);
-        return FALSE;
-    }
-
-    DbgLog("  WriteToReadOnly: PTE flip + IOCTL copy succeeded");
-    return TRUE;
-
-legacy_direct:
-    DbgLog("  WriteToReadOnly: legacy direct IOCTL (may BSOD if .text is read-only)...");
-
-    if (!KM_WriteKernelMemory(kernelAddr, buffer, size)) {
-        DbgLog("  WriteToReadOnly FAIL: direct write returned FALSE");
-        return FALSE;
-    }
-
-    verify = 0;
-    if (!KM_ReadKernelMemory(kernelAddr, &verify, 1)) {
-        DbgLog("  WriteToReadOnly FAIL: verify read failed");
-        return FALSE;
-    }
-
-    if (verify != ((BYTE*)buffer)[0]) {
-        DbgLog("  WriteToReadOnly FAIL: verify mismatch (wrote 0x%02X, read 0x%02X)",
-            ((BYTE*)buffer)[0], verify);
-        return FALSE;
-    }
-
-    DbgLog("  WriteToReadOnly: direct write succeeded and verified");
-    return TRUE;
+    DbgLog("  WriteToReadOnly FAIL: physical and kernel-VA PTE/PDE flips both failed");
+    return FALSE;
 }
 
 BOOL KM_ProcessRelocations(PVOID imageBase, PVOID mappedBase, SIZE_T imageSize) {
