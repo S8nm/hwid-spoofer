@@ -1297,47 +1297,69 @@ void CleanupTempFiles() {
 // ==================== INTEGRATED KDMAPPER ====================
 
 BOOL LoadVulnerableDriver() {
-    if (GetFileAttributesA(g_VulnDriverPath) == INVALID_FILE_ATTRIBUTES)
+    DbgLog("LoadVulnDriver: checking file at %s", g_VulnDriverPath);
+    if (GetFileAttributesA(g_VulnDriverPath) == INVALID_FILE_ATTRIBUTES) {
+        DbgLog("LoadVulnDriver FAIL: file not found (err=%lu)", GetLastError());
         return FALSE;
+    }
 
-    // Need full path for service creation
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(g_VulnDriverPath, GetFileExInfoStandard, &fad)) {
+        ULONG64 sz = ((ULONG64)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        DbgLog("LoadVulnDriver: file size = %llu bytes", sz);
+    }
+
     CHAR fullPath[MAX_PATH];
     GetFullPathNameA(g_VulnDriverPath, MAX_PATH, fullPath, NULL);
+    DbgLog("LoadVulnDriver: full path = %s", fullPath);
 
     SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    if (!scm) return FALSE;
+    if (!scm) {
+        DbgLog("LoadVulnDriver FAIL: OpenSCManager (err=%lu)", GetLastError());
+        return FALSE;
+    }
 
-    // Use randomized service name
     SC_HANDLE svc = CreateServiceA(scm, g_VulnServiceName, g_VulnServiceName,
         SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
         SERVICE_ERROR_NORMAL, fullPath, NULL, NULL, NULL, NULL, NULL);
 
     DWORD createError = GetLastError();
+    DbgLog("LoadVulnDriver: CreateService=%s (err=%lu)", svc ? "OK" : "FAIL", createError);
     if (!svc && createError != ERROR_SERVICE_EXISTS) {
         CloseServiceHandle(scm);
         return FALSE;
     }
     if (!svc) {
         svc = OpenServiceA(scm, g_VulnServiceName, SERVICE_ALL_ACCESS);
+        DbgLog("LoadVulnDriver: OpenService=%s", svc ? "OK" : "FAIL");
     }
+
+    DbgLog("LoadVulnDriver: >>> ABOUT TO CALL StartServiceA <<<");
+    DbgLog("LoadVulnDriver: If log ends here, BSOD is in iqvw64e.sys DriverEntry");
 
     if (!StartServiceA(svc, 0, NULL)) {
         DWORD startError = GetLastError();
+        DbgLog("LoadVulnDriver: StartService failed (err=%lu)", startError);
         if (startError != ERROR_SERVICE_ALREADY_RUNNING) {
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
             return FALSE;
         }
+        DbgLog("LoadVulnDriver: service already running, continuing");
+    } else {
+        DbgLog("LoadVulnDriver: StartService OK - driver loaded");
     }
 
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
 
-    // Driver is now loaded in kernel â€” immediately wipe the file from disk
     SecureWipeFile(g_VulnDriverPath);
 
+    DbgLog("LoadVulnDriver: opening device %s", g_VulnDeviceName);
     g_hVulnDriver = CreateFileA(g_VulnDeviceName, GENERIC_READ | GENERIC_WRITE,
         0, NULL, OPEN_EXISTING, 0, NULL);
+    DbgLog("LoadVulnDriver: device handle=0x%llX (err=%lu)",
+        (ULONG64)g_hVulnDriver, GetLastError());
 
     return (g_hVulnDriver != INVALID_HANDLE_VALUE);
 }
@@ -1784,25 +1806,39 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
     return ((LONG)ntStatus >= 0);
 }
 
+static char g_DbgPath[MAX_PATH] = {0};
+
+static void DbgInit() {
+    GetModuleFileNameA(NULL, g_DbgPath, MAX_PATH);
+    char* slash = strrchr(g_DbgPath, '\\');
+    if (slash) *(slash + 1) = 0;
+    strcat_s(g_DbgPath, MAX_PATH, "hwid_debug.log");
+    DeleteFileA(g_DbgPath);
+}
+
 static void DbgLog(const char* fmt, ...) {
-    FILE* f = fopen("C:\\ProgramData\\hwid_debug.log", "a");
-    if (!f) return;
+    if (!g_DbgPath[0]) DbgInit();
+    HANDLE hFile = CreateFileA(g_DbgPath, FILE_APPEND_DATA, FILE_SHARE_READ,
+        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    char buf[1024];
     SYSTEMTIME st;
     GetLocalTime(&st);
-    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    int pos = sprintf_s(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
+    pos += vsprintf_s(buf + pos, sizeof(buf) - pos, fmt, ap);
     va_end(ap);
-    fprintf(f, "\n");
-    fflush(f);
-    fclose(f);
+    buf[pos++] = '\r'; buf[pos++] = '\n';
+    DWORD written;
+    WriteFile(hFile, buf, pos, &written, NULL);
+    FlushFileBuffers(hFile);
+    CloseHandle(hFile);
 }
 
 BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
-    DeleteFileA("C:\\ProgramData\\hwid_debug.log");
-
-    DbgLog("=== HWID Spoofer Debug Log ===");
+    DbgLog("=== KM_MapDriverFromMemory entered ===");
     DbgLog("KernelBase = 0x%llX", (ULONG64)g_KernelBase);
     DbgLog("VulnDriver handle = 0x%llX", (ULONG64)g_hVulnDriver);
 
@@ -1924,37 +1960,50 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     DbgLog("STEP 7 result: %s", result ? "SUCCESS" : "FAILED");
     DbgLog("=== Debug log complete - all steps finished ===");
 
-    if (result) DeleteFileA("C:\\ProgramData\\hwid_debug.log");
-
     return result;
 }
 
 // ==================== DRIVER MANAGEMENT ====================
 
 BOOL LoadSpooferDriver() {
+    DbgInit();
+    DbgLog("========================================");
+    DbgLog("=== HWID Spoofer Diagnostic Log ===");
+    DbgLog("========================================");
+    DbgLog("Windows build: %lu", GetVersion());
+
+    DbgLog("STAGE 1: Loading vulnerable driver...");
     if (!LoadVulnerableDriver()) {
         DWORD err = GetLastError();
-        char msg[256];
+        DbgLog("STAGE 1 FAIL: err=%lu", err);
+        char msg[512];
         sprintf_s(msg, sizeof(msg),
             "Stage 1 failed: vulnerable driver won't load.\n"
             "Error code: %lu\n\n"
             "- Disable Memory Integrity in Windows Security\n"
             "- Disable Vulnerable Driver Blocklist (registry)\n"
-            "- Reboot after changing settings", err);
+            "- Reboot after changing settings\n\n"
+            "Debug log: same folder as Manager.exe", err);
         MessageBoxA(g_hWnd, msg, "Driver Error - Stage 1", MB_ICONERROR);
         return FALSE;
     }
+    DbgLog("STAGE 1 PASSED: vulnerable driver loaded");
 
+    DbgLog("STAGE 2: Getting kernel base...");
     g_KernelBase = KM_GetKernelBase();
     if (!g_KernelBase) {
+        DbgLog("STAGE 2 FAIL: KM_GetKernelBase returned NULL");
         MessageBoxA(g_hWnd, "Stage 2 failed: cannot locate kernel base address.",
             "Driver Error - Stage 2", MB_ICONERROR);
         UnloadVulnerableDriver();
         return FALSE;
     }
+    DbgLog("STAGE 2 PASSED: KernelBase=0x%llX", (ULONG64)g_KernelBase);
 
+    DbgLog("STAGE 3: Loading spoofer driver resource...");
     HRSRC hRes = FindResourceA(g_hInst, MAKEINTRESOURCEA(IDR_SPOOFER_SYS), RT_RCDATA);
     if (!hRes) {
+        DbgLog("STAGE 3 FAIL: FindResourceA returned NULL");
         MessageBoxA(g_hWnd, "Stage 3 failed: spoofer driver resource not found in EXE.",
             "Driver Error - Stage 3", MB_ICONERROR);
         UnloadVulnerableDriver();
@@ -1965,18 +2014,23 @@ BOOL LoadSpooferDriver() {
     DWORD resSize = SizeofResource(g_hInst, hRes);
     PVOID resData = hData ? LockResource(hData) : NULL;
     if (!resData || resSize == 0) {
+        DbgLog("STAGE 3 FAIL: resource data NULL or size 0");
         MessageBoxA(g_hWnd, "Stage 3 failed: cannot read spoofer driver resource.",
             "Driver Error - Stage 3", MB_ICONERROR);
         UnloadVulnerableDriver();
         return FALSE;
     }
+    DbgLog("STAGE 3 PASSED: resource size=%lu bytes", resSize);
 
+    DbgLog("STAGE 4: Mapping spoofer driver into kernel...");
     if (!KM_MapDriverFromMemory(resData, resSize)) {
+        DbgLog("STAGE 4 FAIL: KM_MapDriverFromMemory returned FALSE");
         MessageBoxA(g_hWnd, "Stage 4 failed: kernel driver mapping failed.\n\n"
             "Possible causes:\n"
             "- Kernel pool allocation failed\n"
             "- Import resolution failed\n"
-            "- DriverEntry returned error",
+            "- DriverEntry returned error\n\n"
+            "Check hwid_debug.log next to Manager.exe",
             "Driver Error - Stage 4", MB_ICONERROR);
         UnloadVulnerableDriver();
         return FALSE;
