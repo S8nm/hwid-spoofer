@@ -1541,6 +1541,10 @@ ULONG64 KM_GetDirectoryTableBase() {
 
 static ULONG64 g_PteBase = 0;
 
+static BOOL IsCanonicalKernelAddr(ULONG64 addr) {
+    return (addr >> 48) == 0xFFFF;
+}
+
 static ULONG64 FindPteBase() {
     if (g_PteBase) return g_PteBase;
 
@@ -1552,20 +1556,44 @@ static ULONG64 FindPteBase() {
     BYTE* base = (BYTE*)kernel;
     SIZE_T imgSize = nt->OptionalHeader.SizeOfImage;
 
+    /*
+     * MiGetPteAddress patterns:
+     *   Pattern A: shr rax,9 / mov rcx,imm64 / add rax,rcx / ret
+     *              48 C1 E8 09 / 48 B9 [8 bytes] / 48 03 C1 / C3
+     *   Pattern B: shr rcx,9 / mov rax,imm64 / add rax,rcx / ret
+     *              48 C1 E9 09 / 48 B8 [8 bytes] / 48 03 C1 / C3
+     */
     for (SIZE_T i = 0; i < imgSize - 20; i++) {
-        if (base[i]   == 0x48 && base[i+1] == 0xC1 &&
-            base[i+2] == 0xE8 && base[i+3] == 0x09 &&
-            base[i+4] == 0x48 && base[i+5] == 0xB9) {
-            g_PteBase = *(ULONG64*)(base + i + 6);
+        ULONG64 candidate = 0;
+        BOOL matched = FALSE;
+
+        if (base[i] == 0x48 && base[i+1] == 0xC1 && base[i+3] == 0x09) {
+            if (base[i+2] == 0xE8 && base[i+4] == 0x48 && base[i+5] == 0xB9 &&
+                base[i+14] == 0x48 && base[i+15] == 0x03 && base[i+16] == 0xC1) {
+                candidate = *(ULONG64*)(base + i + 6);
+                matched = TRUE;
+            }
+            else if (base[i+2] == 0xE9 && base[i+4] == 0x48 && base[i+5] == 0xB8 &&
+                     base[i+14] == 0x48 && base[i+15] == 0x03 && base[i+16] == 0xC1) {
+                candidate = *(ULONG64*)(base + i + 6);
+                matched = TRUE;
+            }
+        }
+
+        if (matched && IsCanonicalKernelAddr(candidate)) {
+            g_PteBase = candidate;
             DbgLog("  FindPteBase: found at offset 0x%llX, PTE_BASE=0x%llX",
                 (ULONG64)i, g_PteBase);
             FreeLibrary(kernel);
             return g_PteBase;
+        } else if (matched) {
+            DbgLog("  FindPteBase: rejected non-canonical match at 0x%llX = 0x%llX",
+                (ULONG64)i, candidate);
         }
     }
 
     FreeLibrary(kernel);
-    DbgLog("  FindPteBase: MiGetPteAddress pattern not found");
+    DbgLog("  FindPteBase: no valid MiGetPteAddress pattern found in ntoskrnl");
     return 0;
 }
 
