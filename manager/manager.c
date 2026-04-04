@@ -1539,19 +1539,77 @@ ULONG64 KM_GetDirectoryTableBase() {
     return dirBase;
 }
 
+static ULONG64 g_PteBase = 0;
+
+static ULONG64 FindPteBase() {
+    if (g_PteBase) return g_PteBase;
+
+    HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!kernel) return 0;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)kernel;
+    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((BYTE*)kernel + dos->e_lfanew);
+    BYTE* base = (BYTE*)kernel;
+    SIZE_T imgSize = nt->OptionalHeader.SizeOfImage;
+
+    for (SIZE_T i = 0; i < imgSize - 20; i++) {
+        if (base[i]   == 0x48 && base[i+1] == 0xC1 &&
+            base[i+2] == 0xE8 && base[i+3] == 0x09 &&
+            base[i+4] == 0x48 && base[i+5] == 0xB9) {
+            g_PteBase = *(ULONG64*)(base + i + 6);
+            DbgLog("  FindPteBase: found at offset 0x%llX, PTE_BASE=0x%llX",
+                (ULONG64)i, g_PteBase);
+            FreeLibrary(kernel);
+            return g_PteBase;
+        }
+    }
+
+    FreeLibrary(kernel);
+    DbgLog("  FindPteBase: MiGetPteAddress pattern not found");
+    return 0;
+}
+
 BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     DbgLog("  WriteToReadOnly: VA=0x%llX, size=%llu", kernelAddr, (ULONG64)size);
-    ULONG64 dirBase = KM_GetDirectoryTableBase();
-    if (!dirBase) { DbgLog("  WriteToReadOnly FAIL: no DTB"); return FALSE; }
-    DbgLog("  WriteToReadOnly: DTB=0x%llX", dirBase);
 
-    ULONG64 physAddr = KM_TranslateLinearAddress(dirBase, kernelAddr);
-    if (!physAddr) { DbgLog("  WriteToReadOnly FAIL: translate returned 0"); return FALSE; }
-    DbgLog("  WriteToReadOnly: PA=0x%llX", physAddr);
+    ULONG64 pteBase = FindPteBase();
+    if (!pteBase) {
+        DbgLog("  WriteToReadOnly FAIL: cannot find PTE_BASE");
+        return FALSE;
+    }
 
-    DbgLog("  WriteToReadOnly: mapping physical page and writing...");
-    BOOL ok = KM_WritePhysicalAddress(physAddr, buffer, size);
-    DbgLog("  WriteToReadOnly: result=%s", ok ? "OK" : "FAIL");
+    ULONG64 pteAddr = pteBase + ((kernelAddr >> 12) << 3);
+    DbgLog("  WriteToReadOnly: PTE at VA=0x%llX", pteAddr);
+
+    ULONG64 origPte = 0;
+    if (!KM_ReadKernelMemory(pteAddr, &origPte, sizeof(origPte))) {
+        DbgLog("  WriteToReadOnly FAIL: cannot read PTE");
+        return FALSE;
+    }
+    DbgLog("  WriteToReadOnly: original PTE=0x%llX", origPte);
+
+    if (!(origPte & 1)) {
+        DbgLog("  WriteToReadOnly FAIL: page not present");
+        return FALSE;
+    }
+
+    ULONG64 newPte = (origPte | 2) & ~((ULONG64)1 << 63);
+    DbgLog("  WriteToReadOnly: modified PTE=0x%llX (set RW, clear NX)", newPte);
+
+    if (!KM_WriteKernelMemory(pteAddr, &newPte, sizeof(newPte))) {
+        DbgLog("  WriteToReadOnly FAIL: cannot write modified PTE");
+        return FALSE;
+    }
+
+    SwitchToThread();
+
+    DbgLog("  WriteToReadOnly: writing %llu bytes to target...", (ULONG64)size);
+    BOOL ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+    DbgLog("  WriteToReadOnly: write result=%s", ok ? "OK" : "FAIL");
+
+    KM_WriteKernelMemory(pteAddr, &origPte, sizeof(origPte));
+    DbgLog("  WriteToReadOnly: PTE restored");
+
     return ok;
 }
 
@@ -1893,38 +1951,6 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     DbgLog("STEP 2 PASSED: %d sections copied to local image", nt->FileHeader.NumberOfSections);
 
     DbgLog("STEP 3: Allocating kernel pool (size=%llu)...", (ULONG64)imageSize);
-    DbgLog("  STEP 3a: Getting DirectoryTableBase (CR3)...");
-    ULONG64 dtb = KM_GetDirectoryTableBase();
-    DbgLog("  STEP 3a result: DTB=0x%llX", dtb);
-    if (!dtb) {
-        DbgLog("  STEP 3a FAIL: could not get directory table base");
-        VirtualFree(localImage, 0, MEM_RELEASE);
-        MessageBoxA(g_hWnd, "Debug: Step 3a failed - cannot get CR3/DTB.\n"
-            "See C:\\ProgramData\\hwid_debug.log", "Debug", MB_ICONERROR);
-        return FALSE;
-    }
-
-    DbgLog("  STEP 3b: Finding code cave...");
-    ULONG64 codeCave = KM_FindCodeCave(80);
-    DbgLog("  STEP 3b result: codeCave=0x%llX", codeCave);
-    if (!codeCave) {
-        DbgLog("  STEP 3b FAIL: no code cave found");
-        VirtualFree(localImage, 0, MEM_RELEASE);
-        return FALSE;
-    }
-
-    DbgLog("  STEP 3c: Translating code cave VA to PA...");
-    ULONG64 codeCavePA = KM_TranslateLinearAddress(dtb, codeCave);
-    DbgLog("  STEP 3c result: PA=0x%llX", codeCavePA);
-    if (!codeCavePA) {
-        DbgLog("  STEP 3c FAIL: VA-to-PA translation failed for code cave");
-        VirtualFree(localImage, 0, MEM_RELEASE);
-        MessageBoxA(g_hWnd, "Debug: Step 3c failed - page table walk broken.\n"
-            "See C:\\ProgramData\\hwid_debug.log", "Debug", MB_ICONERROR);
-        return FALSE;
-    }
-
-    DbgLog("  STEP 3d: Writing shellcode to code cave via physical memory...");
     ULONG64 kernelPool = KM_AllocateKernelPool(imageSize);
     DbgLog("STEP 3 result: kernelPool=0x%llX", kernelPool);
     if (!kernelPool) {
