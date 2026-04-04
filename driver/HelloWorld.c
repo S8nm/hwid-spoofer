@@ -385,13 +385,21 @@ static VOID WriteLog() {
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK io;
     HANDLE hf;
+    NTSTATUS createSt;
 
     RtlInitUnicodeString(&fp, L"\\??\\C:\\ProgramData\\hwid_log.bin");
     InitializeObjectAttributes(&oa, &fp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
-    if (NT_SUCCESS(ZwCreateFile(&hf, GENERIC_WRITE | SYNCHRONIZE, &oa, &io,
+    createSt = ZwCreateFile(&hf, GENERIC_WRITE | SYNCHRONIZE, &oa, &io,
+        NULL, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, 0, FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(createSt)) {
+        RtlInitUnicodeString(&fp, L"\\??\\C:\\Windows\\Temp\\hwid_log.bin");
+        InitializeObjectAttributes(&oa, &fp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        createSt = ZwCreateFile(&hf, GENERIC_WRITE | SYNCHRONIZE, &oa, &io,
             NULL, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, 0, FILE_OVERWRITE_IF,
-            FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0))) {
+            FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    }
+    if (NT_SUCCESS(createSt)) {
         ZwWriteFile(hf, NULL, NULL, NULL, &io, &g_Log, sizeof(IDLOG), NULL, NULL);
         ZwClose(hf);
     }
@@ -451,7 +459,14 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             while (sp + 1 < end && !(sp[0] == 0 && sp[1] == 0)) {
                 SIZE_T sl = SafeStrLen(sp, end);
                 if (sl == 0) break;
-                if (num == idx) ReplaceString(sp, sl, g_BS);
+                if (num == idx) {
+                    if (!g_Logged && !g_Log.OBs[0]) {
+                        SIZE_T cl = min(sl, (SIZE_T)63);
+                        RtlCopyMemory(g_Log.OBs, sp, cl);
+                        g_Log.OBs[cl] = '\0';
+                    }
+                    ReplaceString(sp, sl, g_BS);
+                }
                 sp += sl + 1; num++;
             }
         }

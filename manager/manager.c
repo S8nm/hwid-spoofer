@@ -152,6 +152,14 @@ static void SetLastMapFailV(const char* fmt, ...) {
 
 static void ClearLastMapFail(void) { g_LastMapFail[0] = 0; }
 
+static BOOL KM_AllowUnsafeKernelVaProbe(void) {
+    char v[8] = {0};
+    DWORD n = GetEnvironmentVariableA("HWID_ALLOW_UNSAFE_KVA_PTE_SCAN", v, (DWORD)sizeof(v));
+    if (n == 0 || n >= sizeof(v))
+        return FALSE;
+    return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+}
+
 // ==================== KDMAPPER STRUCTURES ====================
 
 typedef struct {
@@ -844,7 +852,16 @@ static BOOL GetSMBIOSString(BYTE smbType, BYTE strOffset, char* buffer, size_t b
         return FALSE;
     }
 
+    if (fwSize < sizeof(SMB_HDR)) {
+        free(data);
+        return FALSE;
+    }
+
     SMB_HDR* hdr = (SMB_HDR*)data;
+    if (hdr->Length == 0 || hdr->Length > fwSize - sizeof(SMB_HDR)) {
+        free(data);
+        return FALSE;
+    }
     BYTE* tbl = data + sizeof(SMB_HDR);
     BYTE* tblEnd = tbl + hdr->Length;
     BYTE* ptr = tbl;
@@ -861,7 +878,8 @@ static BOOL GetSMBIOSString(BYTE smbType, BYTE strOffset, char* buffer, size_t b
                 BYTE* strings = ptr + length;
                 BYTE num = 1;
                 while (strings < tblEnd - 1 && !(strings[0] == 0 && strings[1] == 0)) {
-                    size_t sl = strlen((char*)strings);
+                    size_t sl = strnlen_s((char*)strings, (size_t)(tblEnd - strings));
+                    if (sl == 0 || sl >= (size_t)(tblEnd - strings)) break;
                     if (num == strIdx && sl > 0) {
                         strncpy_s(buffer, bufferSize, (char*)strings, _TRUNCATE);
                         found = TRUE;
@@ -883,6 +901,44 @@ static BOOL GetSMBIOSString(BYTE smbType, BYTE strOffset, char* buffer, size_t b
     return found;
 }
 
+static void TrimAsciiInPlace(char* s) {
+    size_t i, len, start = 0, end;
+    if (!s) return;
+    len = strlen(s);
+    while (start < len && (unsigned char)s[start] <= ' ') start++;
+    end = len;
+    while (end > start && (unsigned char)s[end - 1] <= ' ') end--;
+    if (start > 0 && end > start) {
+        memmove(s, s + start, end - start);
+        s[end - start] = '\0';
+    } else if (start > 0) {
+        s[0] = '\0';
+    } else {
+        s[end] = '\0';
+    }
+    for (i = 0; s[i]; i++) {
+        if (s[i] == '\t' || s[i] == '\r' || s[i] == '\n')
+            s[i] = ' ';
+    }
+}
+
+static BOOL IsLowEntropySerial(const char* s) {
+    size_t i, len;
+    char first = 0;
+    BOOL allSame = TRUE;
+    if (!s || !s[0]) return TRUE;
+    len = strlen(s);
+    if (len < 2) return TRUE;
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+        if (c != ' ' && c != '-' && c != '_' && c != '0' && c != '.') {
+            if (!first) first = c;
+            if (c != first) allSame = FALSE;
+        }
+    }
+    return allSame;
+}
+
 /* OEMs often leave placeholder text in the registry; treat as missing so SMBIOS can supply a real value. */
 static BOOL IsPlaceholderSerial(const char* s) {
     static const char* bad[] = {
@@ -902,10 +958,18 @@ static BOOL IsPlaceholderSerial(const char* s) {
         "0",
     };
     size_t i;
+    char norm[256];
     if (!s || !s[0]) return TRUE;
+    strncpy_s(norm, sizeof(norm), s, _TRUNCATE);
+    TrimAsciiInPlace(norm);
+    if (!norm[0]) return TRUE;
+    if (IsLowEntropySerial(norm)) return TRUE;
     for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
-        if (_stricmp(s, bad[i]) == 0) return TRUE;
+        if (_stricmp(norm, bad[i]) == 0) return TRUE;
     }
+    if (strstr(norm, "To be filled") || strstr(norm, "To Be Filled") ||
+        strstr(norm, "Default") || strstr(norm, "Not Specified"))
+        return TRUE;
     return FALSE;
 }
 
@@ -917,11 +981,21 @@ BOOL GetBIOSSerial(char* buffer, size_t bufferSize) {
         DWORD type = 0;
         LSTATUS res = RegQueryValueExA(hKey, "SystemSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
         RegCloseKey(hKey);
+        TrimAsciiInPlace(buffer);
         if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0' && !IsPlaceholderSerial(buffer))
             return TRUE;
     }
-    if (GetSMBIOSString(1, 0x07, buffer, bufferSize) && !IsPlaceholderSerial(buffer))
-        return TRUE;
+    if (GetSMBIOSString(1, 0x07, buffer, bufferSize)) {
+        TrimAsciiInPlace(buffer);
+        if (!IsPlaceholderSerial(buffer))
+            return TRUE;
+    }
+    if (GetSMBIOSString(1, 0x04, buffer, bufferSize)) {
+        /* Some firmware places serial-like value in product-name slot; use only as last resort. */
+        TrimAsciiInPlace(buffer);
+        if (!IsPlaceholderSerial(buffer))
+            return TRUE;
+    }
     buffer[0] = '\0';
     return FALSE;
 }
@@ -934,11 +1008,20 @@ BOOL GetBoardSerial(char* buffer, size_t bufferSize) {
         DWORD type = 0;
         LSTATUS res = RegQueryValueExA(hKey, "BaseBoardSerialNumber", NULL, &type, (LPBYTE)buffer, &size);
         RegCloseKey(hKey);
+        TrimAsciiInPlace(buffer);
         if (res == ERROR_SUCCESS && type == REG_SZ && buffer[0] != '\0' && !IsPlaceholderSerial(buffer))
             return TRUE;
     }
-    if (GetSMBIOSString(2, 0x07, buffer, bufferSize) && !IsPlaceholderSerial(buffer))
-        return TRUE;
+    if (GetSMBIOSString(2, 0x07, buffer, bufferSize)) {
+        TrimAsciiInPlace(buffer);
+        if (!IsPlaceholderSerial(buffer))
+            return TRUE;
+    }
+    if (GetSMBIOSString(2, 0x06, buffer, bufferSize)) {
+        TrimAsciiInPlace(buffer);
+        if (!IsPlaceholderSerial(buffer))
+            return TRUE;
+    }
     buffer[0] = '\0';
     return FALSE;
 }
@@ -1817,6 +1900,15 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     } else
         DbgLog("  WriteToReadOnly: no verified CR3 from MZ test — trying kernel VA PTE flip");
 
+    if (!KM_AllowUnsafeKernelVaProbe()) {
+        DbgLog("  WriteToReadOnly: kernel-VA PTE scan disabled (unsafe with case 0x33 on unmapped slots)");
+        SetLastMapFailV(
+            "Kernel write path aborted safely: physical PTE walk unavailable, and kernel-VA PTE scan is disabled to prevent BSOD on this build. "
+            "Set HWID_ALLOW_UNSAFE_KVA_PTE_SCAN=1 only for diagnostic testing.");
+        return FALSE;
+    }
+
+    DbgLog("  WriteToReadOnly: UNSAFE kernel-VA PTE scan explicitly enabled by environment");
     {
         ULONG64 pteBase = KM_FindPteBaseForSystem();
         if (!pteBase) {
