@@ -234,6 +234,8 @@ BOOL ReadHwidLog();
 void SaveHwidLogToDocuments();
 static void SignalDriverRevert();
 
+static void DbgLog(const char* fmt, ...);
+
 // Kdmapper integrated functions
 BOOL LoadVulnerableDriver();
 VOID UnloadVulnerableDriver();
@@ -1396,8 +1398,11 @@ PVOID KM_MapPhysicalMemory(ULONG64 physAddr, SIZE_T size) {
     input.phys_addr = physAddr;
     input.size = size;
     DWORD returned = 0;
-    DeviceIoControl(g_hVulnDriver, IOCTL_NAL_MAP,
+    BOOL ok = DeviceIoControl(g_hVulnDriver, IOCTL_NAL_MAP,
         &input, sizeof(input), &input, sizeof(input), &returned, NULL);
+    DbgLog("    MapPhys: PA=0x%llX size=%llu -> VA=0x%llX (ioctl=%s, err=%lu)",
+        physAddr, (ULONG64)size, (ULONG64)input.return_ptr,
+        ok ? "OK" : "FAIL", GetLastError());
     return (PVOID)input.return_ptr;
 }
 
@@ -1418,8 +1423,13 @@ BOOL KM_CopyKernelMemory(ULONG64 dest, ULONG64 src, SIZE_T size) {
     input.destination = dest;
     input.length = (ULONG64)size;
     DWORD returned = 0;
-    return DeviceIoControl(g_hVulnDriver, IOCTL_NAL_MAP,
+    BOOL ok = DeviceIoControl(g_hVulnDriver, IOCTL_NAL_MAP,
         &input, sizeof(input), NULL, 0, &returned, NULL);
+    if (!ok) {
+        DbgLog("    CopyMem FAIL: dst=0x%llX src=0x%llX size=%llu err=%lu",
+            dest, src, (ULONG64)size, GetLastError());
+    }
+    return ok;
 }
 
 BOOL KM_ReadKernelMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
@@ -1508,13 +1518,19 @@ ULONG64 KM_GetDirectoryTableBase() {
 }
 
 BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
+    DbgLog("  WriteToReadOnly: VA=0x%llX, size=%llu", kernelAddr, (ULONG64)size);
     ULONG64 dirBase = KM_GetDirectoryTableBase();
-    if (!dirBase) return FALSE;
+    if (!dirBase) { DbgLog("  WriteToReadOnly FAIL: no DTB"); return FALSE; }
+    DbgLog("  WriteToReadOnly: DTB=0x%llX", dirBase);
 
     ULONG64 physAddr = KM_TranslateLinearAddress(dirBase, kernelAddr);
-    if (!physAddr) return FALSE;
+    if (!physAddr) { DbgLog("  WriteToReadOnly FAIL: translate returned 0"); return FALSE; }
+    DbgLog("  WriteToReadOnly: PA=0x%llX", physAddr);
 
-    return KM_WritePhysicalAddress(physAddr, buffer, size);
+    DbgLog("  WriteToReadOnly: mapping physical page and writing...");
+    BOOL ok = KM_WritePhysicalAddress(physAddr, buffer, size);
+    DbgLog("  WriteToReadOnly: result=%s", ok ? "OK" : "FAIL");
+    return ok;
 }
 
 PVOID KM_GetKernelExport(const char* name) {
@@ -1661,23 +1677,39 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     *(ULONG64*)(sc + 30) = (ULONG64)pExAllocatePool;
     *(ULONG64*)(sc + 42) = halD1;
 
-    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc)))
+    DbgLog("  AllocPool: ExAllocatePool=0x%llX, HalD1=0x%llX, codeCave=0x%llX",
+        (ULONG64)pExAllocatePool, halD1, codeCave);
+    DbgLog("  AllocPool: writing shellcode to code cave...");
+    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc))) {
+        DbgLog("  AllocPool FAIL: could not write shellcode to code cave");
         return 0;
+    }
+    DbgLog("  AllocPool: shellcode written OK");
 
     ULONG64 originalFunc = 0;
-    if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc)))
+    if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc))) {
+        DbgLog("  AllocPool FAIL: could not read original HalDispatch[1]");
         return 0;
+    }
+    DbgLog("  AllocPool: original HalDispatch[1]=0x%llX", originalFunc);
 
-    if (!KM_WriteKernelMemory(halD1, &codeCave, sizeof(codeCave)))
+    DbgLog("  AllocPool: patching HalDispatch[1] -> codeCave...");
+    if (!KM_WriteKernelMemory(halD1, &codeCave, sizeof(codeCave))) {
+        DbgLog("  AllocPool FAIL: could not write HalDispatch[1]");
         return 0;
+    }
+    DbgLog("  AllocPool: HalDispatch patched, calling NtQueryIntervalProfile...");
 
     ULONG interval = 0;
     NtQIP(2, &interval);
+    DbgLog("  AllocPool: NtQIP returned (survived!)");
 
     ULONG64 poolAddr = 0;
     KM_ReadKernelMemory(halD1, &poolAddr, sizeof(poolAddr));
+    DbgLog("  AllocPool: poolAddr=0x%llX", poolAddr);
 
     KM_WriteKernelMemory(halD1, &originalFunc, sizeof(originalFunc));
+    DbgLog("  AllocPool: HalDispatch[1] restored");
 
     return poolAddr;
 }
@@ -1716,28 +1748,88 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
     *(ULONG64*)(sc + 13) = entryAddr;
     *(ULONG64*)(sc + 25) = halD1;
 
-    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc)))
+    DbgLog("  CallEntry: entryAddr=0x%llX, codeCave=0x%llX", entryAddr, codeCave);
+    DbgLog("  CallEntry: writing shellcode to code cave...");
+    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc))) {
+        DbgLog("  CallEntry FAIL: could not write shellcode");
         return FALSE;
+    }
+    DbgLog("  CallEntry: shellcode written OK");
 
     ULONG64 originalFunc = 0;
-    if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc)))
+    if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc))) {
+        DbgLog("  CallEntry FAIL: could not read HalDispatch[1]");
         return FALSE;
+    }
+    DbgLog("  CallEntry: original HalDispatch[1]=0x%llX", originalFunc);
 
-    if (!KM_WriteKernelMemory(halD1, &codeCave, sizeof(codeCave)))
+    DbgLog("  CallEntry: patching HalDispatch[1] -> codeCave...");
+    if (!KM_WriteKernelMemory(halD1, &codeCave, sizeof(codeCave))) {
+        DbgLog("  CallEntry FAIL: could not patch HalDispatch[1]");
         return FALSE;
+    }
+    DbgLog("  CallEntry: calling NtQueryIntervalProfile (THIS IS THE DANGEROUS CALL)...");
 
     ULONG interval = 0;
     NtQIP(2, &interval);
+    DbgLog("  CallEntry: NtQIP returned (survived DriverEntry!)");
 
     ULONG64 ntStatus = 0;
     KM_ReadKernelMemory(halD1, &ntStatus, sizeof(ntStatus));
+    DbgLog("  CallEntry: DriverEntry NTSTATUS=0x%llX", ntStatus);
 
     KM_WriteKernelMemory(halD1, &originalFunc, sizeof(originalFunc));
+    DbgLog("  CallEntry: HalDispatch[1] restored");
 
     return ((LONG)ntStatus >= 0);
 }
 
+static void DbgLog(const char* fmt, ...) {
+    FILE* f = fopen("C:\\ProgramData\\hwid_debug.log", "a");
+    if (!f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fflush(f);
+    fclose(f);
+}
+
 BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
+    DeleteFileA("C:\\ProgramData\\hwid_debug.log");
+
+    DbgLog("=== HWID Spoofer Debug Log ===");
+    DbgLog("KernelBase = 0x%llX", (ULONG64)g_KernelBase);
+    DbgLog("VulnDriver handle = 0x%llX", (ULONG64)g_hVulnDriver);
+
+    DbgLog("STEP 1: Canary read - reading 2 bytes from KernelBase...");
+    USHORT dosSignature = 0;
+    BOOL canaryOk = KM_ReadKernelMemory((ULONG64)g_KernelBase, &dosSignature, sizeof(dosSignature));
+    DbgLog("STEP 1 result: read=%s, signature=0x%04X (expect 0x5A4D)",
+        canaryOk ? "OK" : "FAIL", dosSignature);
+
+    if (!canaryOk || dosSignature != 0x5A4D) {
+        char msg[512];
+        sprintf_s(msg, sizeof(msg),
+            "Kernel access canary FAILED.\n\n"
+            "KernelBase: 0x%llX\n"
+            "Read: %s\n"
+            "Signature: 0x%04X (expected 0x5A4D = 'MZ')\n\n"
+            "If read FAILED: case 0x33 IOCTL is broken\n"
+            "  with this iqvw64e.sys version.\n\n"
+            "If signature is WRONG: kernel base address\n"
+            "  is incorrect (EnumDeviceDrivers bug).\n\n"
+            "See C:\\ProgramData\\hwid_debug.log",
+            (ULONG64)g_KernelBase, canaryOk ? "OK" : "FAILED", dosSignature);
+        MessageBoxA(g_hWnd, msg, "HWID Spoofer - Canary Failed", MB_ICONERROR);
+        return FALSE;
+    }
+    DbgLog("STEP 1 PASSED: kernel base is valid, case 0x33 works");
+
     if (!fileBuffer || fileSize < sizeof(IMAGE_DOS_HEADER)) return FALSE;
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)fileBuffer;
@@ -1746,8 +1838,10 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     SIZE_T imageSize = nt->OptionalHeader.SizeOfImage;
     DWORD entryRVA = nt->OptionalHeader.AddressOfEntryPoint;
 
+    DbgLog("STEP 2: PE parsed - imageSize=%llu, entryRVA=0x%X", (ULONG64)imageSize, entryRVA);
+
     PVOID localImage = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!localImage) return FALSE;
+    if (!localImage) { DbgLog("STEP 2 FAIL: VirtualAlloc returned NULL"); return FALSE; }
 
     memcpy(localImage, fileBuffer, nt->OptionalHeader.SizeOfHeaders);
 
@@ -1760,25 +1854,79 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
                 sec[i].SizeOfRawData);
         }
     }
+    DbgLog("STEP 2 PASSED: %d sections copied to local image", nt->FileHeader.NumberOfSections);
 
+    DbgLog("STEP 3: Allocating kernel pool (size=%llu)...", (ULONG64)imageSize);
+    DbgLog("  STEP 3a: Getting DirectoryTableBase (CR3)...");
+    ULONG64 dtb = KM_GetDirectoryTableBase();
+    DbgLog("  STEP 3a result: DTB=0x%llX", dtb);
+    if (!dtb) {
+        DbgLog("  STEP 3a FAIL: could not get directory table base");
+        VirtualFree(localImage, 0, MEM_RELEASE);
+        MessageBoxA(g_hWnd, "Debug: Step 3a failed - cannot get CR3/DTB.\n"
+            "See C:\\ProgramData\\hwid_debug.log", "Debug", MB_ICONERROR);
+        return FALSE;
+    }
+
+    DbgLog("  STEP 3b: Finding code cave...");
+    ULONG64 codeCave = KM_FindCodeCave(80);
+    DbgLog("  STEP 3b result: codeCave=0x%llX", codeCave);
+    if (!codeCave) {
+        DbgLog("  STEP 3b FAIL: no code cave found");
+        VirtualFree(localImage, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    DbgLog("  STEP 3c: Translating code cave VA to PA...");
+    ULONG64 codeCavePA = KM_TranslateLinearAddress(dtb, codeCave);
+    DbgLog("  STEP 3c result: PA=0x%llX", codeCavePA);
+    if (!codeCavePA) {
+        DbgLog("  STEP 3c FAIL: VA-to-PA translation failed for code cave");
+        VirtualFree(localImage, 0, MEM_RELEASE);
+        MessageBoxA(g_hWnd, "Debug: Step 3c failed - page table walk broken.\n"
+            "See C:\\ProgramData\\hwid_debug.log", "Debug", MB_ICONERROR);
+        return FALSE;
+    }
+
+    DbgLog("  STEP 3d: Writing shellcode to code cave via physical memory...");
     ULONG64 kernelPool = KM_AllocateKernelPool(imageSize);
+    DbgLog("STEP 3 result: kernelPool=0x%llX", kernelPool);
     if (!kernelPool) {
+        DbgLog("STEP 3 FAIL: kernel pool allocation returned 0");
         VirtualFree(localImage, 0, MEM_RELEASE);
+        MessageBoxA(g_hWnd, "Debug: Step 3 failed - pool allocation failed.\n"
+            "See C:\\ProgramData\\hwid_debug.log", "Debug", MB_ICONERROR);
         return FALSE;
     }
+    DbgLog("STEP 3 PASSED: kernel pool at 0x%llX", kernelPool);
 
+    DbgLog("STEP 4: Processing relocations...");
     KM_ProcessRelocations(localImage, (PVOID)kernelPool, imageSize);
+    DbgLog("STEP 4 PASSED");
+
+    DbgLog("STEP 5: Resolving imports...");
     if (!KM_ResolveImports(localImage)) {
+        DbgLog("STEP 5 FAIL: import resolution failed");
         VirtualFree(localImage, 0, MEM_RELEASE);
         return FALSE;
     }
+    DbgLog("STEP 5 PASSED");
 
+    DbgLog("STEP 6: Writing driver image to kernel pool...");
     KM_WriteKernelMemory(kernelPool, localImage, imageSize);
+    DbgLog("STEP 6 PASSED");
 
     VirtualFree(localImage, 0, MEM_RELEASE);
 
+    DbgLog("STEP 7: Calling DriverEntry at 0x%llX...", kernelPool + entryRVA);
     ULONG64 entryAddr = kernelPool + entryRVA;
-    return KM_CallDriverEntry(entryAddr);
+    BOOL result = KM_CallDriverEntry(entryAddr);
+    DbgLog("STEP 7 result: %s", result ? "SUCCESS" : "FAILED");
+    DbgLog("=== Debug log complete - all steps finished ===");
+
+    if (result) DeleteFileA("C:\\ProgramData\\hwid_debug.log");
+
+    return result;
 }
 
 // ==================== DRIVER MANAGEMENT ====================
