@@ -4,6 +4,8 @@
 
 #include <ntddk.h>
 #include <ntddstor.h>
+#include <ntdddisk.h>
+#include <ntddscsi.h>
 #include <ntstrsafe.h>
 
 extern POBJECT_TYPE *IoDriverObjectType;
@@ -23,11 +25,18 @@ NTSYSCALLAPI NTSTATUS NTAPI ZwCreateEvent(
 
 // ==================== CONSTANTS ====================
 
-#define IO_SMART         0x7C088
-#define IO_ATA           0x4D02C
-#define IO_ATA_D         0x4D030
-#define IO_NVME_CMD      0x2D5140
+/* IOCTL values from shared\ntdddisk.h, ntddscsi.h, ntddstor.h (CTL_CODE stable with WDK). */
 #define ID_ATA_IDENT     0xEC
+
+#ifndef OID_GEN_CURRENT_ADDRESS
+#define OID_GEN_CURRENT_ADDRESS       0x0001010B
+#define OID_GEN_PERMANENT_ADDRESS     0x0001010A
+#define OID_802_3_CURRENT_ADDRESS     0x01010102
+#define OID_802_3_PERMANENT_ADDRESS   0x01010101
+#endif
+
+#define IOCTL_NDIS_QUERY_GLOBAL_STATS \
+    CTL_CODE(FILE_DEVICE_PHYSICAL_NETCARD, 0, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 
 // ==================== STRUCTURES ====================
 
@@ -115,6 +124,7 @@ typedef struct _IDLOG {
     CHAR OGp[64]; CHAR FGp[64];
     CHAR OMn[48]; CHAR FMn[48];
     CHAR OFr[16]; CHAR FFr[16];
+    CHAR OSmbMb[64]; /* SMBIOS Type 2 board string (before spoof); OMs = registry BaseBoard only */
 } IDLOG;
 #pragma pack(pop)
 
@@ -227,6 +237,10 @@ static VOID HookRemove(PIH h) {
     if (!h || !h->Active) return;
     SafeWrite(h->Orig, h->SavedBytes, 14);
     h->Active = FALSE;
+    if (h->Trampoline) {
+        ExFreePoolWithTag(h->Trampoline, 'prmT');
+        h->Trampoline = NULL;
+    }
 }
 
 // ==================== DISPATCH TABLE HOOK ====================
@@ -450,7 +464,8 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
                 SIZE_T sl = SafeStrLen(sp, end);
                 if (sl == 0) break;
                 if (num == idx) {
-                    if (!g_Logged) RtlCopyMemory(g_Log.OMs, sp, min(sl, 63));
+                    if (!g_Logged)
+                        RtlCopyMemory(g_Log.OSmbMb, sp, min(sl, 63));
                     ReplaceString(sp, sl, g_MB);
                 }
                 sp += sl + 1; num++;
@@ -480,25 +495,36 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
 
 NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp);
 
+static SIZE_T BoundedStrLen(PCHAR s, SIZE_T maxChars) {
+    for (SIZE_T i = 0; i < maxChars; i++) {
+        if (s[i] == '\0')
+            return i;
+    }
+    return maxChars;
+}
+
 static VOID SpoofStorageQP(PVOID buf, ULONG_PTR len) {
     PSTORAGE_DEVICE_DESCRIPTOR d = (PSTORAGE_DEVICE_DESCRIPTOR)buf;
 
     if (d->SerialNumberOffset > 0 && d->SerialNumberOffset < len) {
         PCHAR s = (PCHAR)((PUCHAR)d + d->SerialNumberOffset);
         SIZE_T ml = len - d->SerialNumberOffset;
-        if (!g_Logged) RtlCopyMemory(g_Log.ODs, s, min(strlen(s), 63));
+        SIZE_T slen = BoundedStrLen(s, ml);
+        if (!g_Logged) RtlCopyMemory(g_Log.ODs, s, min(slen, 63));
         if (ml > strlen(g_DS)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_DS, strlen(g_DS)); }
     }
     if (d->ProductIdOffset > 0 && d->ProductIdOffset < len) {
         PCHAR s = (PCHAR)((PUCHAR)d + d->ProductIdOffset);
         SIZE_T ml = len - d->ProductIdOffset;
-        if (!g_Logged) RtlCopyMemory(g_Log.OMn, s, min(strlen(s), 47));
+        SIZE_T slen = BoundedStrLen(s, ml);
+        if (!g_Logged) RtlCopyMemory(g_Log.OMn, s, min(slen, 47));
         if (ml > strlen(g_MN)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_MN, strlen(g_MN)); }
     }
     if (d->ProductRevisionOffset > 0 && d->ProductRevisionOffset < len) {
         PCHAR s = (PCHAR)((PUCHAR)d + d->ProductRevisionOffset);
         SIZE_T ml = len - d->ProductRevisionOffset;
-        if (!g_Logged) RtlCopyMemory(g_Log.OFr, s, min(strlen(s), 15));
+        SIZE_T slen = BoundedStrLen(s, ml);
+        if (!g_Logged) RtlCopyMemory(g_Log.OFr, s, min(slen, 15));
         if (ml > strlen(g_FR)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_FR, strlen(g_FR)); }
     }
 }
@@ -528,7 +554,9 @@ static VOID SpoofATA(PVOID buf, ULONG len) {
 }
 
 static VOID SpoofSMART(PVOID buf, ULONG len) {
-    if (len > 24 + 512) SpoofATA((PUCHAR)buf + 24, 512);
+    /* Need IDENTIFY payload: 24-byte header + 512 bytes (inclusive minimum len is 536). */
+    if (len >= 24 + 512)
+        SpoofATA((PUCHAR)buf + 24, 512);
 }
 
 NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
@@ -547,28 +575,47 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         }
         return st;
     }
-    if (code == IO_SMART) {
+    if (code == SMART_RCV_DRIVE_DATA) {
         NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer)
             SpoofSMART(irp->AssociatedIrp.SystemBuffer, (ULONG)irp->IoStatus.Information);
         return st;
     }
-    if (code == IO_ATA || code == IO_ATA_D) {
+    if (code == IOCTL_ATA_PASS_THROUGH || code == IOCTL_ATA_PASS_THROUGH_DIRECT) {
         NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
-        if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer) {
-            PATA_PT a = (PATA_PT)irp->AssociatedIrp.SystemBuffer;
-            if (a->CurTF[6] == ID_ATA_IDENT && a->DataLen >= 512)
-                SpoofATA((PUCHAR)a + a->DataOff, a->DataLen);
+        if (NT_SUCCESS(st) && irp->AssociatedIrp.SystemBuffer) {
+            ULONG inLen = sp->Parameters.DeviceIoControl.InputBufferLength;
+            ULONG outLen = sp->Parameters.DeviceIoControl.OutputBufferLength;
+            ULONG bufLen = inLen > outLen ? inLen : outLen;
+            if (bufLen >= sizeof(ATA_PT)) {
+                PATA_PT a = (PATA_PT)irp->AssociatedIrp.SystemBuffer;
+                UINT_PTR base = (UINT_PTR)irp->AssociatedIrp.SystemBuffer;
+                UINT_PTR end = base + bufLen;
+                UINT_PTR data = base + a->DataOff;
+                if (a->CurTF[6] == ID_ATA_IDENT && a->DataLen >= 512 &&
+                    data + a->DataLen <= end)
+                    SpoofATA((PVOID)data, a->DataLen);
+            }
         }
         return st;
     }
-    if (code == IO_NVME_CMD) {
+    if (code == IOCTL_STORAGE_PROTOCOL_COMMAND) {
         NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
-        if (NT_SUCCESS(st) && irp->IoStatus.Information > 64 && irp->AssociatedIrp.SystemBuffer) {
-            PUCHAR d = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
-            SIZE_T slen = min(strlen(g_DS), 20);
-            RtlZeroMemory(d + 44, 20);
-            RtlCopyMemory(d + 44, g_DS, slen);
+        if (NT_SUCCESS(st) && irp->AssociatedIrp.SystemBuffer) {
+            ULONG inLen = sp->Parameters.DeviceIoControl.InputBufferLength;
+            ULONG outLen = sp->Parameters.DeviceIoControl.OutputBufferLength;
+            ULONG bufLen = inLen > outLen ? inLen : outLen;
+            ULONG info = (ULONG)irp->IoStatus.Information;
+            ULONG usable = info < bufLen ? info : bufLen;
+            /* NVMe Identify layout in this IOCTL: 20-byte serial often at offset 44; require room. */
+            const ULONG kNvmeSerialOff = 44;
+            const ULONG kNvmeSerialLen = 20;
+            if (usable >= kNvmeSerialOff + kNvmeSerialLen) {
+                PUCHAR d = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
+                SIZE_T slen = min(strlen(g_DS), (SIZE_T)kNvmeSerialLen);
+                RtlZeroMemory(d + kNvmeSerialOff, kNvmeSerialLen);
+                RtlCopyMemory(d + kNvmeSerialOff, g_DS, slen);
+            }
         }
         return st;
     }
@@ -577,24 +624,49 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
 
 // ==================== NDIS HOOK ====================
 
-NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp);
+static BOOLEAN NdisOidIsMacAddress(ULONG oid) {
+    return oid == OID_GEN_CURRENT_ADDRESS ||
+        oid == OID_GEN_PERMANENT_ADDRESS ||
+        oid == OID_802_3_CURRENT_ADDRESS ||
+        oid == OID_802_3_PERMANENT_ADDRESS;
+}
+
+static VOID SpoofNdisMacOutput(PIRP irp) {
+    PUCHAR mac = NULL;
+    if (irp->MdlAddress) {
+        mac = (PUCHAR)MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+    }
+    if (!mac)
+        mac = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
+    if (!mac || irp->IoStatus.Information < 6)
+        return;
+    BOOLEAN ok = FALSE;
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0 && mac[i] != 0xFF) { ok = TRUE; break; }
+    }
+    if (!ok)
+        return;
+    if (!g_Logged)
+        RtlCopyMemory(g_Log.OMc, mac, 6);
+    RtlCopyMemory(mac, g_MC, 6);
+}
 
 NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
 
     if (sp->MajorFunction == IRP_MJ_INTERNAL_DEVICE_CONTROL ||
         sp->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
+        ULONG oid = 0;
+        ULONG ioControlCode = sp->Parameters.DeviceIoControl.IoControlCode;
+        if (ioControlCode == IOCTL_NDIS_QUERY_GLOBAL_STATS &&
+            irp->AssociatedIrp.SystemBuffer &&
+            sp->Parameters.DeviceIoControl.InputBufferLength >= sizeof(ULONG)) {
+            oid = *(PULONG)irp->AssociatedIrp.SystemBuffer;
+        }
         NTSTATUS st = CallOrigDH(&g_hNdis, dev, irp);
-        if (NT_SUCCESS(st) && irp->IoStatus.Information >= 6) {
-            PUCHAR mac = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
-            if (mac) {
-                BOOLEAN ok = FALSE;
-                for (int i = 0; i < 6; i++) { if (mac[i] != 0 && mac[i] != 0xFF) { ok = TRUE; break; } }
-                if (ok) {
-                    if (!g_Logged) RtlCopyMemory(g_Log.OMc, mac, 6);
-                    RtlCopyMemory(mac, g_MC, 6);
-                }
-            }
+        if (NT_SUCCESS(st) && ioControlCode == IOCTL_NDIS_QUERY_GLOBAL_STATS &&
+            NdisOidIsMacAddress(oid)) {
+            SpoofNdisMacOutput(irp);
         }
         return st;
     }
@@ -602,8 +674,6 @@ NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
 }
 
 // ==================== FS HOOK (VOLUME SERIAL) ====================
-
-NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp);
 
 NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
@@ -633,7 +703,11 @@ NTSTATUS NTAPI HkNtQuerySysInfo(ULONG Class, PVOID Info, ULONG Length, PULONG Re
             if (fi->ProviderSignature == 'RSMB' && fi->Action == 1 && fi->TableBufferLength > 0) {
                 ULONG copyLen = fi->TableBufferLength < g_SpoofedSMBIOSLen
                     ? fi->TableBufferLength : g_SpoofedSMBIOSLen;
-                RtlCopyMemory(fi->TableBuffer, g_SpoofedSMBIOS, copyLen);
+                /* TableBuffer follows 4x ULONG; avoid writing past caller's Length. */
+                if (copyLen > 0 &&
+                    Length >= sizeof(ULONG) * 4 + copyLen) {
+                    RtlCopyMemory(fi->TableBuffer, g_SpoofedSMBIOS, copyLen);
+                }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
     }
@@ -885,10 +959,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
             if (NT_SUCCESS(refSt) && g_pRevertEvent) {
                 KeClearEvent(g_pRevertEvent);
 
-                HANDLE hThread;
-                PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
+                HANDLE hThread = NULL;
+                NTSTATUS thrSt = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
                     NULL, NULL, NULL, RevertThread, NULL);
-                ZwClose(hThread);
+                if (NT_SUCCESS(thrSt) && hThread)
+                    ZwClose(hThread);
             }
         }
     }
