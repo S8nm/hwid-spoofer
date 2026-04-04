@@ -218,6 +218,8 @@ manager\build\Release\Manager\Manager.exe    (~220KB, self-contained)
 
 This single file is everything you need. No DLLs, no config files, no runtime dependencies.
 
+**GitHub releases** ship **only `Manager.exe`** (one download). It is self-contained; separate `HelloWorld.sys` / `KDMapper.exe` zips are not required for normal use.
+
 ### Visual Studio Build
 
 1. Open `HWIDSpoofer.sln`
