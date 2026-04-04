@@ -31,6 +31,13 @@ NTSYSCALLAPI NTSTATUS NTAPI ZwCreateEvent(
 
 // ==================== STRUCTURES ====================
 
+typedef struct _DH {
+    PDRIVER_OBJECT DriverObj;
+    ULONG MajorFn;
+    PVOID OrigFunc;
+    BOOLEAN Active;
+} DH;
+
 typedef struct _IH {
     PVOID Orig;
     PVOID Det;
@@ -126,9 +133,9 @@ static UCHAR g_MC[6]  = {0};
 static ULONG g_VS     = 0;
 static CHAR g_GP[64]  = {0};
 
-static IH g_hDisk    = {0};
-static IH g_hNdis    = {0};
-static IH g_hFs      = {0};
+static DH g_hDisk    = {0};
+static DH g_hNdis    = {0};
+static DH g_hFs      = {0};
 static IH g_hSysInfo = {0};
 
 static PUCHAR g_SpoofedSMBIOS    = NULL;
@@ -222,24 +229,39 @@ static VOID HookRemove(PIH h) {
     h->Active = FALSE;
 }
 
-static NTSTATUS CallOrig(PIH h, PDEVICE_OBJECT dev, PIRP irp) {
-    FnDispatch fn = (FnDispatch)h->Trampoline;
-    return fn(dev, irp);
-}
+// ==================== DISPATCH TABLE HOOK ====================
 
-// ==================== FIND DRIVER DISPATCH ====================
-
-static PVOID FindDispatch(PCWSTR name, ULONG mj) {
+static BOOLEAN DispatchHookInstall(PCWSTR name, ULONG mj, PVOID detour, DH* h) {
+    if (mj > IRP_MJ_MAXIMUM_FUNCTION) return FALSE;
     UNICODE_STRING uName;
     PDRIVER_OBJECT dObj = NULL;
     RtlInitUnicodeString(&uName, name);
     NTSTATUS st = ObReferenceObjectByName(
         &uName, OBJ_CASE_INSENSITIVE, NULL, 0,
         *IoDriverObjectType, KernelMode, NULL, (PVOID*)&dObj);
-    if (!NT_SUCCESS(st)) return NULL;
-    PVOID fn = (mj <= IRP_MJ_MAXIMUM_FUNCTION) ? dObj->MajorFunction[mj] : NULL;
-    ObDereferenceObject(dObj);
-    return fn;
+    if (!NT_SUCCESS(st) || !dObj) return FALSE;
+
+    h->DriverObj = dObj;
+    h->MajorFn = mj;
+    h->OrigFunc = InterlockedExchangePointer(
+        (PVOID*)&dObj->MajorFunction[mj], detour);
+    h->Active = TRUE;
+    return TRUE;
+}
+
+static VOID DispatchHookRemove(DH* h) {
+    if (!h || !h->Active) return;
+    InterlockedExchangePointer(
+        (PVOID*)&h->DriverObj->MajorFunction[h->MajorFn],
+        h->OrigFunc);
+    ObDereferenceObject(h->DriverObj);
+    h->DriverObj = NULL;
+    h->Active = FALSE;
+}
+
+static NTSTATUS CallOrigDH(DH* h, PDEVICE_OBJECT dev, PIRP irp) {
+    FnDispatch fn = (FnDispatch)h->OrigFunc;
+    return fn(dev, irp);
 }
 
 // ==================== RANDOM GENERATION ====================
@@ -518,7 +540,7 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         ULONG savedPropId = (ULONG)-1;
         if (b) savedPropId = ((PSTORAGE_PROPERTY_QUERY)b)->PropertyId;
 
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
+        NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && savedPropId == StorageDeviceProperty &&
             irp->IoStatus.Information > sizeof(STORAGE_DEVICE_DESCRIPTOR) && b) {
             SpoofStorageQP(b, irp->IoStatus.Information);
@@ -526,13 +548,13 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         return st;
     }
     if (code == IO_SMART) {
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
+        NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer)
             SpoofSMART(irp->AssociatedIrp.SystemBuffer, (ULONG)irp->IoStatus.Information);
         return st;
     }
     if (code == IO_ATA || code == IO_ATA_D) {
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
+        NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 0 && irp->AssociatedIrp.SystemBuffer) {
             PATA_PT a = (PATA_PT)irp->AssociatedIrp.SystemBuffer;
             if (a->CurTF[6] == ID_ATA_IDENT && a->DataLen >= 512)
@@ -541,7 +563,7 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         return st;
     }
     if (code == IO_NVME_CMD) {
-        NTSTATUS st = CallOrig(&g_hDisk, dev, irp);
+        NTSTATUS st = CallOrigDH(&g_hDisk, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information > 64 && irp->AssociatedIrp.SystemBuffer) {
             PUCHAR d = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
             SIZE_T slen = min(strlen(g_DS), 20);
@@ -550,7 +572,7 @@ NTSTATUS HkDisk(PDEVICE_OBJECT dev, PIRP irp) {
         }
         return st;
     }
-    return CallOrig(&g_hDisk, dev, irp);
+    return CallOrigDH(&g_hDisk, dev, irp);
 }
 
 // ==================== NDIS HOOK ====================
@@ -562,7 +584,7 @@ NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
 
     if (sp->MajorFunction == IRP_MJ_INTERNAL_DEVICE_CONTROL ||
         sp->MajorFunction == IRP_MJ_DEVICE_CONTROL) {
-        NTSTATUS st = CallOrig(&g_hNdis, dev, irp);
+        NTSTATUS st = CallOrigDH(&g_hNdis, dev, irp);
         if (NT_SUCCESS(st) && irp->IoStatus.Information >= 6) {
             PUCHAR mac = (PUCHAR)irp->AssociatedIrp.SystemBuffer;
             if (mac) {
@@ -576,7 +598,7 @@ NTSTATUS HkNdis(PDEVICE_OBJECT dev, PIRP irp) {
         }
         return st;
     }
-    return CallOrig(&g_hNdis, dev, irp);
+    return CallOrigDH(&g_hNdis, dev, irp);
 }
 
 // ==================== FS HOOK (VOLUME SERIAL) ====================
@@ -585,7 +607,7 @@ NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp);
 
 NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
-    NTSTATUS st = CallOrig(&g_hFs, dev, irp);
+    NTSTATUS st = CallOrigDH(&g_hFs, dev, irp);
 
     if (NT_SUCCESS(st) &&
         sp->Parameters.QueryVolume.FsInformationClass == 1 &&
@@ -779,9 +801,9 @@ static VOID RevertThread(PVOID context) {
     UNREFERENCED_PARAMETER(context);
     KeWaitForSingleObject(g_pRevertEvent, Executive, KernelMode, FALSE, NULL);
 
-    HookRemove(&g_hDisk);
-    HookRemove(&g_hNdis);
-    HookRemove(&g_hFs);
+    DispatchHookRemove(&g_hDisk);
+    DispatchHookRemove(&g_hNdis);
+    DispatchHookRemove(&g_hFs);
     HookRemove(&g_hSysInfo);
 
     RevertRegistry();
@@ -800,18 +822,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     SpoofRegistry();
     SpoofMACRegistry();
 
-    PVOID fn = NULL;
-    fn = FindDispatch(L"\\Driver\\disk", IRP_MJ_DEVICE_CONTROL);
-    if (!fn) fn = FindDispatch(L"\\Driver\\storahci", IRP_MJ_DEVICE_CONTROL);
-    if (!fn) fn = FindDispatch(L"\\Driver\\stornvme", IRP_MJ_DEVICE_CONTROL);
-    if (fn) HookInstall(fn, HkDisk, &g_hDisk);
+    if (!DispatchHookInstall(L"\\Driver\\disk", IRP_MJ_DEVICE_CONTROL, HkDisk, &g_hDisk))
+        if (!DispatchHookInstall(L"\\Driver\\storahci", IRP_MJ_DEVICE_CONTROL, HkDisk, &g_hDisk))
+            DispatchHookInstall(L"\\Driver\\stornvme", IRP_MJ_DEVICE_CONTROL, HkDisk, &g_hDisk);
 
-    fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_DEVICE_CONTROL);
-    if (!fn) fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_INTERNAL_DEVICE_CONTROL);
-    if (fn) HookInstall(fn, HkNdis, &g_hNdis);
+    if (!DispatchHookInstall(L"\\Driver\\ndis", IRP_MJ_DEVICE_CONTROL, HkNdis, &g_hNdis))
+        DispatchHookInstall(L"\\Driver\\ndis", IRP_MJ_INTERNAL_DEVICE_CONTROL, HkNdis, &g_hNdis);
 
-    fn = FindDispatch(L"\\FileSystem\\Ntfs", IRP_MJ_QUERY_VOLUME_INFORMATION);
-    if (fn) HookInstall(fn, HkFs, &g_hFs);
+    DispatchHookInstall(L"\\FileSystem\\Ntfs", IRP_MJ_QUERY_VOLUME_INFORMATION, HkFs, &g_hFs);
 
     {
         ULONG needed = 0;
