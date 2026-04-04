@@ -1507,13 +1507,16 @@ BOOL KM_WritePhysicalAddress(ULONG64 physAddr, PVOID buffer, SIZE_T size) {
 }
 
 ULONG64 KM_TranslateLinearAddress(ULONG64 dirBase, ULONG64 virtualAddr) {
+    /* CR3: physical frame of PML4; low bits may hold PCID / flags */
+    ULONG64 cr3 = dirBase & 0xFFFFFFFFFFFFF000ULL;
+
     USHORT pml4Idx  = (USHORT)((virtualAddr >> 39) & 0x1FF);
     USHORT pdptIdx  = (USHORT)((virtualAddr >> 30) & 0x1FF);
     USHORT pdIdx    = (USHORT)((virtualAddr >> 21) & 0x1FF);
     USHORT ptIdx    = (USHORT)((virtualAddr >> 12) & 0x1FF);
 
     ULONG64 pml4e = 0;
-    if (!KM_ReadPhysicalAddress(dirBase + pml4Idx * 8, &pml4e, sizeof(pml4e)))
+    if (!KM_ReadPhysicalAddress(cr3 + pml4Idx * 8, &pml4e, sizeof(pml4e)))
         return 0;
     if (!(pml4e & 1)) return 0;
 
@@ -1555,16 +1558,142 @@ ULONG64 KM_GetDirectoryTableBase() {
     return dirBase;
 }
 
+PVOID KM_GetKernelExport(const char* name) {
+    HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!kernel) return NULL;
+
+    PVOID proc = GetProcAddress(kernel, name);
+    if (!proc) { FreeLibrary(kernel); return NULL; }
+
+    ULONG64 offset = (ULONG64)proc - (ULONG64)kernel;
+    FreeLibrary(kernel);
+    return (PVOID)((ULONG64)g_KernelBase + offset);
+}
+
+/* Physical address of the PTE/PDE/PDPTE slot that maps this VA (4K, 2MB, or 1GB page). */
+static ULONG64 KM_GetPageTableEntryPhysicalAddress(ULONG64 dirBaseRaw, ULONG64 virtualAddr) {
+    ULONG64 cr3 = dirBaseRaw & 0xFFFFFFFFFFFFF000ULL;
+
+    USHORT pml4Idx = (USHORT)((virtualAddr >> 39) & 0x1FF);
+    USHORT pdptIdx = (USHORT)((virtualAddr >> 30) & 0x1FF);
+    USHORT pdIdx   = (USHORT)((virtualAddr >> 21) & 0x1FF);
+    USHORT ptIdx   = (USHORT)((virtualAddr >> 12) & 0x1FF);
+
+    ULONG64 pml4e = 0;
+    if (!KM_ReadPhysicalAddress(cr3 + pml4Idx * 8, &pml4e, sizeof(pml4e)))
+        return 0;
+    if (!(pml4e & 1)) return 0;
+
+    ULONG64 pdpt_phys = pml4e & 0xFFFFFFFFFF000ULL;
+
+    ULONG64 pdpte = 0;
+    if (!KM_ReadPhysicalAddress(pdpt_phys + pdptIdx * 8, &pdpte, sizeof(pdpte)))
+        return 0;
+    if (!(pdpte & 1)) return 0;
+    if (pdpte & 0x80)
+        return pdpt_phys + pdptIdx * 8; /* 1GB page: modify PDPTE */
+
+    ULONG64 pd_phys = pdpte & 0xFFFFFFFFFF000ULL;
+    ULONG64 pde = 0;
+    if (!KM_ReadPhysicalAddress(pd_phys + pdIdx * 8, &pde, sizeof(pde)))
+        return 0;
+    if (!(pde & 1)) return 0;
+    if (pde & 0x80)
+        return pd_phys + pdIdx * 8; /* 2MB page: modify PDE */
+
+    ULONG64 pt_phys = pde & 0xFFFFFFFFFF000ULL;
+    return pt_phys + ptIdx * 8;
+}
+
+/* Pick a CR3 that actually translates KernelBase -> MZ at the expected physical frame. */
+static ULONG64 KM_GetVerifiedDirectoryTableBase(void) {
+    PVOID pInitProc = KM_GetKernelExport("PsInitialSystemProcess");
+    if (!pInitProc) return 0;
+
+    ULONG64 eprocess = 0;
+    if (!KM_ReadKernelMemory((ULONG64)pInitProc, &eprocess, sizeof(eprocess)) || !eprocess)
+        return 0;
+
+    static const ULONG64 kprocessOffsets[] = { 0x28, 0x158 };
+    for (ULONG i = 0; i < sizeof(kprocessOffsets) / sizeof(kprocessOffsets[0]); i++) {
+        ULONG64 dir = 0;
+        if (!KM_ReadKernelMemory(eprocess + kprocessOffsets[i], &dir, sizeof(dir)) || !dir)
+            continue;
+        ULONG64 phys = KM_TranslateLinearAddress(dir, (ULONG64)g_KernelBase);
+        if (!phys) continue;
+        USHORT mz = 0;
+        if (!KM_ReadPhysicalAddress(phys, &mz, sizeof(mz))) continue;
+        if (mz == 0x5A4D)
+            return dir;
+    }
+
+    ULONG64 fb = 0;
+    if (KM_ReadKernelMemory(eprocess + 0x28, &fb, sizeof(fb)) && fb)
+        return fb;
+    return 0;
+}
+
 BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
+    BYTE verify = 0;
+    BOOL vr = FALSE;
+
     DbgLog("  WriteToReadOnly: VA=0x%llX, size=%llu", kernelAddr, (ULONG64)size);
-    DbgLog("  WriteToReadOnly: trying direct write (large page mapping may allow it)...");
+
+    ULONG64 dirBase = KM_GetVerifiedDirectoryTableBase();
+    if (!dirBase) {
+        DbgLog("  WriteToReadOnly: no verified CR3; trying legacy direct IOCTL write...");
+        goto legacy_direct;
+    }
+
+    ULONG64 ptePhys = KM_GetPageTableEntryPhysicalAddress(dirBase, kernelAddr);
+    if (!ptePhys) {
+        DbgLog("  WriteToReadOnly: could not resolve PTE/PDE physical address; trying legacy direct...");
+        goto legacy_direct;
+    }
+
+    DbgLog("  WriteToReadOnly: PTE/PDE slot PA=0x%llX (flip RW via physical map)", ptePhys);
+
+    ULONG64 oldEntry = 0;
+    if (!KM_ReadPhysicalAddress(ptePhys, &oldEntry, sizeof(oldEntry))) {
+        DbgLog("  WriteToReadOnly: cannot read page table (MmMapIoSpace). Refusing legacy direct write to avoid BSOD.");
+        return FALSE;
+    }
+
+    ULONG64 newEntry = oldEntry | 0x2ULL; /* Intel PTE/PDE R/W */
+    BOOL flipped = (newEntry != oldEntry);
+
+    if (flipped) {
+        if (!KM_WritePhysicalAddress(ptePhys, &newEntry, sizeof(newEntry))) {
+            DbgLog("  WriteToReadOnly: failed to set R/W bit on page table entry");
+            return FALSE;
+        }
+    }
+
+    BOOL ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+    verify = 0;
+    vr = KM_ReadKernelMemory(kernelAddr, &verify, 1);
+
+    if (flipped)
+        KM_WritePhysicalAddress(ptePhys, &oldEntry, sizeof(oldEntry));
+
+    if (!ok || !vr || verify != ((BYTE*)buffer)[0]) {
+        DbgLog("  WriteToReadOnly FAIL after PTE flip: ok=%d vr=%d verify=0x%02X expect=0x%02X",
+            (int)ok, (int)vr, verify, ((BYTE*)buffer)[0]);
+        return FALSE;
+    }
+
+    DbgLog("  WriteToReadOnly: PTE flip + IOCTL copy succeeded");
+    return TRUE;
+
+legacy_direct:
+    DbgLog("  WriteToReadOnly: legacy direct IOCTL (may BSOD if .text is read-only)...");
 
     if (!KM_WriteKernelMemory(kernelAddr, buffer, size)) {
         DbgLog("  WriteToReadOnly FAIL: direct write returned FALSE");
         return FALSE;
     }
 
-    BYTE verify = 0;
+    verify = 0;
     if (!KM_ReadKernelMemory(kernelAddr, &verify, 1)) {
         DbgLog("  WriteToReadOnly FAIL: verify read failed");
         return FALSE;
@@ -1578,18 +1707,6 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
 
     DbgLog("  WriteToReadOnly: direct write succeeded and verified");
     return TRUE;
-}
-
-PVOID KM_GetKernelExport(const char* name) {
-    HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
-    if (!kernel) return NULL;
-
-    PVOID proc = GetProcAddress(kernel, name);
-    if (!proc) { FreeLibrary(kernel); return NULL; }
-
-    ULONG64 offset = (ULONG64)proc - (ULONG64)kernel;
-    FreeLibrary(kernel);
-    return (PVOID)((ULONG64)g_KernelBase + offset);
 }
 
 BOOL KM_ProcessRelocations(PVOID imageBase, PVOID mappedBase, SIZE_T imageSize) {
