@@ -1474,14 +1474,27 @@ BOOL KM_ResolveImports(PVOID imageBase) {
 
     PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)imageBase + importDir->VirtualAddress);
     while (importDesc->Name) {
+        PIMAGE_THUNK_DATA origThunk;
+        if (importDesc->OriginalFirstThunk)
+            origThunk = (PIMAGE_THUNK_DATA)((BYTE*)imageBase + importDesc->OriginalFirstThunk);
+        else
+            origThunk = (PIMAGE_THUNK_DATA)((BYTE*)imageBase + importDesc->FirstThunk);
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)imageBase + importDesc->FirstThunk);
-        PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)((BYTE*)imageBase + importDesc->OriginalFirstThunk);
         while (origThunk->u1.AddressOfData) {
-            PIMAGE_IMPORT_BY_NAME imp = (PIMAGE_IMPORT_BY_NAME)((BYTE*)imageBase + origThunk->u1.AddressOfData);
-            PVOID funcAddr = KM_GetKernelExport((const char*)imp->Name);
-            if (funcAddr) {
-                thunk->u1.Function = (ULONG64)funcAddr;
+            if (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64) {
+                thunk++;
+                origThunk++;
+                continue;
             }
+            PIMAGE_IMPORT_BY_NAME imp = (PIMAGE_IMPORT_BY_NAME)((BYTE*)imageBase + (origThunk->u1.AddressOfData & 0x7FFFFFFF));
+            PVOID funcAddr = KM_GetKernelExport((const char*)imp->Name);
+            if (!funcAddr) {
+                char msg[256];
+                wsprintfA(msg, "Failed to resolve kernel import: %s", imp->Name);
+                MessageBoxA(NULL, msg, "Spoofer - Import Error", MB_ICONERROR);
+                return FALSE;
+            }
+            thunk->u1.Function = (ULONG64)funcAddr;
             thunk++;
             origThunk++;
         }
@@ -1557,7 +1570,7 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     unsigned char sc[] = {
         0x53,                                           // push rbx
         0x48, 0x83, 0xEC, 0x20,                        // sub rsp, 0x20
-        0xB9, 0x00, 0x02, 0x00, 0x00,                  // mov ecx, 0x200 (NonPagedPoolExecute)
+        0x48, 0x31, 0xC9,                              // xor rcx, rcx  (NonPagedPool=0, which IS executable)
         0x48, 0xBA,                                     // mov rdx, imm64 (size)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x49, 0xB8,                                     // mov r8, imm64 (tag)
@@ -1574,10 +1587,10 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
         0xC3                                            // ret
     };
 
-    *(ULONG64*)(sc + 12) = (ULONG64)size;
-    *(ULONG64*)(sc + 22) = (ULONG64)0x6B63614D;
-    *(ULONG64*)(sc + 32) = (ULONG64)pExAllocatePool;
-    *(ULONG64*)(sc + 44) = resultAddr;
+    *(ULONG64*)(sc + 10) = (ULONG64)size;
+    *(ULONG64*)(sc + 20) = (ULONG64)0x6B63614D;
+    *(ULONG64*)(sc + 30) = (ULONG64)pExAllocatePool;
+    *(ULONG64*)(sc + 42) = resultAddr;
 
     KM_WriteKernelMemory(codeCave, sc, sizeof(sc));
 
@@ -1660,7 +1673,10 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     }
 
     KM_ProcessRelocations(localImage, (PVOID)kernelPool, imageSize);
-    KM_ResolveImports(localImage);
+    if (!KM_ResolveImports(localImage)) {
+        VirtualFree(localImage, 0, MEM_RELEASE);
+        return FALSE;
+    }
 
     KM_WriteKernelMemory(kernelPool, localImage, imageSize);
 

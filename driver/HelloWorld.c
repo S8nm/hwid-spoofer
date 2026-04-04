@@ -16,6 +16,10 @@ NTSYSCALLAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     ULONG SystemInformationClass, PVOID SystemInformation,
     ULONG SystemInformationLength, PULONG ReturnLength);
 
+NTSYSCALLAPI NTSTATUS NTAPI ZwCreateEvent(
+    PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, EVENT_TYPE EventType,
+    BOOLEAN InitialState);
 
 // ==================== CONSTANTS ====================
 
@@ -360,15 +364,30 @@ static VOID WriteLog() {
 
 // ==================== SMBIOS SPOOFING ====================
 
+static SIZE_T SafeStrLen(PUCHAR s, PUCHAR end) {
+    SIZE_T len = 0;
+    while (s + len < end && s[len] != 0) len++;
+    return len;
+}
+
+static VOID ReplaceString(PUCHAR sp, SIZE_T sl, const CHAR* newStr) {
+    SIZE_T nl = 0;
+    while (newStr[nl]) nl++;
+    RtlZeroMemory(sp, sl);
+    RtlCopyMemory(sp, newStr, min(nl, sl));
+}
+
 static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
     if (length < sizeof(SMBIOS_RAW)) return;
     SMBIOS_RAW* raw = (SMBIOS_RAW*)buffer;
+    if (raw->Length > length - sizeof(SMBIOS_RAW) + sizeof(raw->Data))
+        return;
     PUCHAR data = raw->Data;
     PUCHAR end = data + raw->Length;
 
-    while (data < end) {
+    while (data + 4 <= end) {
         SMBIOS_HDR* hdr = (SMBIOS_HDR*)data;
-        if (data + hdr->Length > end) break;
+        if (hdr->Length < 4 || data + hdr->Length > end) break;
         PUCHAR strings = data + hdr->Length;
         if (strings >= end) break;
 
@@ -376,12 +395,10 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             UCHAR idx = data[0x05];
             UCHAR num = 1;
             PUCHAR sp = strings;
-            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
-                SIZE_T sl = strlen((char*)sp);
-                if (sl > 0 && num == idx) {
-                    RtlZeroMemory(sp, sl);
-                    RtlCopyMemory(sp, g_FR, min(strlen(g_FR), sl));
-                }
+            while (sp + 1 < end && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = SafeStrLen(sp, end);
+                if (sl == 0) break;
+                if (num == idx) ReplaceString(sp, sl, g_FR);
                 sp += sl + 1; num++;
             }
         }
@@ -395,12 +412,10 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             UCHAR idx = data[0x07];
             UCHAR num = 1;
             PUCHAR sp = strings;
-            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
-                SIZE_T sl = strlen((char*)sp);
-                if (sl > 0 && num == idx) {
-                    RtlZeroMemory(sp, sl);
-                    RtlCopyMemory(sp, g_BS, min(strlen(g_BS), sl));
-                }
+            while (sp + 1 < end && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = SafeStrLen(sp, end);
+                if (sl == 0) break;
+                if (num == idx) ReplaceString(sp, sl, g_BS);
                 sp += sl + 1; num++;
             }
         }
@@ -409,12 +424,12 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             UCHAR idx = data[0x07];
             UCHAR num = 1;
             PUCHAR sp = strings;
-            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
-                SIZE_T sl = strlen((char*)sp);
-                if (sl > 0 && num == idx) {
+            while (sp + 1 < end && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = SafeStrLen(sp, end);
+                if (sl == 0) break;
+                if (num == idx) {
                     if (!g_Logged) RtlCopyMemory(g_Log.OMs, sp, min(sl, 63));
-                    RtlZeroMemory(sp, sl);
-                    RtlCopyMemory(sp, g_MB, min(strlen(g_MB), sl));
+                    ReplaceString(sp, sl, g_MB);
                 }
                 sp += sl + 1; num++;
             }
@@ -424,18 +439,17 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
             UCHAR idx = data[0x07];
             UCHAR num = 1;
             PUCHAR sp = strings;
-            while (sp < end - 1 && !(sp[0] == 0 && sp[1] == 0)) {
-                SIZE_T sl = strlen((char*)sp);
-                if (sl > 0 && num == idx) {
-                    RtlZeroMemory(sp, sl);
-                    RtlCopyMemory(sp, g_MB, min(strlen(g_MB), sl));
-                }
+            while (sp + 1 < end && !(sp[0] == 0 && sp[1] == 0)) {
+                SIZE_T sl = SafeStrLen(sp, end);
+                if (sl == 0) break;
+                if (num == idx) ReplaceString(sp, sl, g_MB);
                 sp += sl + 1; num++;
             }
         }
 
         PUCHAR next = strings;
-        while (next < end - 1 && !(next[0] == 0 && next[1] == 0)) next++;
+        while (next + 1 < end && !(next[0] == 0 && next[1] == 0)) next++;
+        if (next + 2 > end) break;
         data = next + 2;
     }
 }
@@ -783,13 +797,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     UNREFERENCED_PARAMETER(DriverObject);
 
     GenAllIDs();
+    SpoofRegistry();
+    SpoofMACRegistry();
 
     PVOID fn = NULL;
-    const WCHAR* drvs[] = { L"\\Driver\\disk", L"\\Driver\\storahci", L"\\Driver\\stornvme" };
-    for (int i = 0; i < 3; i++) {
-        fn = FindDispatch(drvs[i], IRP_MJ_DEVICE_CONTROL);
-        if (fn) break;
-    }
+    fn = FindDispatch(L"\\Driver\\disk", IRP_MJ_DEVICE_CONTROL);
+    if (!fn) fn = FindDispatch(L"\\Driver\\storahci", IRP_MJ_DEVICE_CONTROL);
+    if (!fn) fn = FindDispatch(L"\\Driver\\stornvme", IRP_MJ_DEVICE_CONTROL);
     if (fn) HookInstall(fn, HkDisk, &g_hDisk);
 
     fn = FindDispatch(L"\\Driver\\ndis", IRP_MJ_DEVICE_CONTROL);
@@ -805,7 +819,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         probe.ProviderSignature = 'RSMB';
         probe.Action = 1;
         ZwQuerySystemInformation(76, &probe, sizeof(probe), &needed);
-        if (needed > 0) {
+        if (needed > 0 && needed < 0x100000) {
             FW_TABLE_INFO* fi =
                 (FW_TABLE_INFO*)ExAllocatePoolWithTag(NonPagedPool, needed, 'bmsR');
             if (fi) {
@@ -813,13 +827,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                 fi->ProviderSignature = 'RSMB';
                 fi->Action = 1;
                 NTSTATUS st = ZwQuerySystemInformation(76, fi, needed, &needed);
-                if (NT_SUCCESS(st) && fi->TableBufferLength > 0) {
+                if (NT_SUCCESS(st) && fi->TableBufferLength > 0 &&
+                    fi->TableBufferLength < 0x100000) {
                     SpoofSMBIOS(fi->TableBuffer, fi->TableBufferLength);
                     g_SpoofedSMBIOSLen = fi->TableBufferLength;
                     g_SpoofedSMBIOS = (PUCHAR)ExAllocatePoolWithTag(
                         NonPagedPool, fi->TableBufferLength, 'bmsS');
                     if (g_SpoofedSMBIOS) {
-                        RtlCopyMemory(g_SpoofedSMBIOS, fi->TableBuffer, fi->TableBufferLength);
+                        RtlCopyMemory(g_SpoofedSMBIOS, fi->TableBuffer,
+                            fi->TableBufferLength);
                     }
                 }
                 ExFreePoolWithTag(fi, 'bmsR');
@@ -834,9 +850,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         }
     }
 
-    SpoofRegistry();
-    SpoofMACRegistry();
-
     WriteLog();
 
     {
@@ -847,16 +860,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         HANDLE hEvt;
         if (NT_SUCCESS(ZwCreateEvent(&hEvt, EVENT_ALL_ACCESS, &evtOa,
                 NotificationEvent, FALSE))) {
-            ObReferenceObjectByHandle(hEvt, EVENT_ALL_ACCESS,
+            NTSTATUS refSt = ObReferenceObjectByHandle(hEvt, EVENT_ALL_ACCESS,
                 *ExEventObjectType, KernelMode, (PVOID*)&g_pRevertEvent, NULL);
             ZwClose(hEvt);
 
-            KeClearEvent(g_pRevertEvent);
+            if (NT_SUCCESS(refSt) && g_pRevertEvent) {
+                KeClearEvent(g_pRevertEvent);
 
-            HANDLE hThread;
-            PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
-                NULL, NULL, NULL, RevertThread, NULL);
-            ZwClose(hThread);
+                HANDLE hThread;
+                PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
+                    NULL, NULL, NULL, RevertThread, NULL);
+                ZwClose(hThread);
+            }
         }
     }
 
