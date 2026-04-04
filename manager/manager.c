@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
 #include <iphlpapi.h>
 #include <shlobj.h>
@@ -128,6 +129,7 @@ typedef struct {
     CHAR FakeModelNumber[48];
     CHAR OrigFirmwareRev[16];
     CHAR FakeFirmwareRev[16];
+    CHAR OrigSmbBoardSerial[64]; /* SMBIOS Type 2 original (driver OSmbMb); registry board is OrigBoardSerial */
 } HWID_LOG;
 #pragma pack(pop)
 
@@ -138,6 +140,17 @@ static CHAR g_TempDir[MAX_PATH] = {0};
 static CHAR g_VulnDriverPath[MAX_PATH] = {0};
 static CHAR g_VulnServiceName[32] = {0};
 static CHAR g_VulnDeviceName[64] = {0};
+
+static char g_LastMapFail[512];
+
+static void SetLastMapFailV(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf_s(g_LastMapFail, sizeof(g_LastMapFail), fmt, ap);
+    va_end(ap);
+}
+
+static void ClearLastMapFail(void) { g_LastMapFail[0] = 0; }
 
 // ==================== KDMAPPER STRUCTURES ====================
 
@@ -166,6 +179,8 @@ typedef struct {
     ULONG64 reserved3;
     ULONG64 size;
 } UNMAP_IO_SPACE_BUFFER;
+
+typedef NTSTATUS(NTAPI* pRtlGetVersion)(PRTL_OSVERSIONINFOW);
 
 typedef NTSTATUS(NTAPI* pNtQuerySystemInformation)(
     ULONG SystemInformationClass,
@@ -441,7 +456,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_SpoofExpiry = 0;
                     DoRevertHWID();
                     InvalidateRect(hWnd, NULL, TRUE);
-                    break;
+                    return 0;
                 } else {
                     ULONGLONG remaining = (g_SpoofExpiry - now) / 1000;
                     int days = (int)(remaining / 86400);
@@ -1058,8 +1073,9 @@ void SaveHwidLogToDocuments() {
     fprintf(f, "  Spoofed Serial:    %s\n\n", g_HwidLog.FakeBIOSSerial);
 
     fprintf(f, "--- MOTHERBOARD ---\n");
-    fprintf(f, "  Original Serial:   %s\n", g_HwidLog.OrigBoardSerial);
-    fprintf(f, "  Spoofed Serial:    %s\n\n", g_HwidLog.FakeBoardSerial);
+    fprintf(f, "  Original (registry): %s\n", g_HwidLog.OrigBoardSerial);
+    fprintf(f, "  Original (SMBIOS):   %s\n", g_HwidLog.OrigSmbBoardSerial);
+    fprintf(f, "  Spoofed Serial:      %s\n\n", g_HwidLog.FakeBoardSerial);
 
     fprintf(f, "--- SYSTEM UUID ---\n");
     fprintf(f, "  Original UUID:     %s\n", g_HwidLog.OrigSystemUUID);
@@ -1627,9 +1643,8 @@ BOOL KM_ResolveImports(PVOID imageBase) {
             PIMAGE_IMPORT_BY_NAME imp = (PIMAGE_IMPORT_BY_NAME)((BYTE*)imageBase + (origThunk->u1.AddressOfData & 0x7FFFFFFF));
             PVOID funcAddr = KM_GetKernelExport((const char*)imp->Name);
             if (!funcAddr) {
-                char msg[256];
-                wsprintfA(msg, "Failed to resolve kernel import: %s", imp->Name);
-                MessageBoxA(NULL, msg, "Spoofer - Import Error", MB_ICONERROR);
+                SetLastMapFailV("Import resolution failed: export \"%s\" not found in ntoskrnl.",
+                    imp->Name);
                 return FALSE;
             }
             thunk->u1.Function = (ULONG64)funcAddr;
@@ -1847,6 +1862,7 @@ static void DbgLog(const char* fmt, ...) {
 }
 
 BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
+    ClearLastMapFail();
     DbgLog("=== KM_MapDriverFromMemory entered ===");
     DbgLog("KernelBase = 0x%llX", (ULONG64)g_KernelBase);
     DbgLog("VulnDriver handle = 0x%llX", (ULONG64)g_hVulnDriver);
@@ -1858,24 +1874,18 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
         canaryOk ? "OK" : "FAIL", dosSignature);
 
     if (!canaryOk || dosSignature != 0x5A4D) {
-        char msg[512];
-        sprintf_s(msg, sizeof(msg),
-            "Kernel access canary FAILED.\n\n"
-            "KernelBase: 0x%llX\n"
-            "Read: %s\n"
-            "Signature: 0x%04X (expected 0x5A4D = 'MZ')\n\n"
-            "If read FAILED: case 0x33 IOCTL is broken\n"
-            "  with this iqvw64e.sys version.\n\n"
-            "If signature is WRONG: kernel base address\n"
-            "  is incorrect (EnumDeviceDrivers bug).\n\n"
-            "See C:\\ProgramData\\hwid_debug.log",
-            (ULONG64)g_KernelBase, canaryOk ? "OK" : "FAILED", dosSignature);
-        MessageBoxA(g_hWnd, msg, "HWID Spoofer - Canary Failed", MB_ICONERROR);
+        SetLastMapFailV(
+            "Canary failed: KernelBase=0x%llX read=%s sig=0x%04X (expect MZ). "
+            "Bad read: IOCTL 0x33/copy path. Bad sig: wrong kernel base.",
+            (ULONG64)g_KernelBase, canaryOk ? "OK" : "FAIL", dosSignature);
         return FALSE;
     }
     DbgLog("STEP 1 PASSED: kernel base is valid, case 0x33 works");
 
-    if (!fileBuffer || fileSize < sizeof(IMAGE_DOS_HEADER)) return FALSE;
+    if (!fileBuffer || fileSize < sizeof(IMAGE_DOS_HEADER)) {
+        SetLastMapFailV("Embedded driver resource is missing or too small to be a PE.");
+        return FALSE;
+    }
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)fileBuffer;
     PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((BYTE*)fileBuffer + dos->e_lfanew);
@@ -1886,7 +1896,11 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     DbgLog("STEP 2: PE parsed - imageSize=%llu, entryRVA=0x%X", (ULONG64)imageSize, entryRVA);
 
     PVOID localImage = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!localImage) { DbgLog("STEP 2 FAIL: VirtualAlloc returned NULL"); return FALSE; }
+    if (!localImage) {
+        DbgLog("STEP 2 FAIL: VirtualAlloc returned NULL");
+        SetLastMapFailV("VirtualAlloc for local PE image failed (size %llu).", (ULONG64)imageSize);
+        return FALSE;
+    }
 
     memcpy(localImage, fileBuffer, nt->OptionalHeader.SizeOfHeaders);
 
@@ -1907,8 +1921,7 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     if (!kernelPool) {
         DbgLog("STEP 3 FAIL: kernel pool allocation returned 0");
         VirtualFree(localImage, 0, MEM_RELEASE);
-        MessageBoxA(g_hWnd, "Debug: Step 3 failed - pool allocation failed.\n"
-            "See C:\\ProgramData\\hwid_debug.log", "Debug", MB_ICONERROR);
+        SetLastMapFailV("Kernel pool allocation failed (ExAllocatePool shellcode / HalDispatchTable path).");
         return FALSE;
     }
     DbgLog("STEP 3 PASSED: kernel pool at 0x%llX", kernelPool);
@@ -1921,6 +1934,8 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     if (!KM_ResolveImports(localImage)) {
         DbgLog("STEP 5 FAIL: import resolution failed");
         VirtualFree(localImage, 0, MEM_RELEASE);
+        if (!g_LastMapFail[0])
+            SetLastMapFailV("Import resolution failed.");
         return FALSE;
     }
     DbgLog("STEP 5 PASSED");
@@ -1937,6 +1952,8 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
     DbgLog("STEP 7 result: %s", result ? "SUCCESS" : "FAILED");
     DbgLog("=== Debug log complete - all steps finished ===");
 
+    if (!result)
+        SetLastMapFailV("DriverEntry returned failure or shellcode did not run (see NTSTATUS in hwid_debug.log).");
     return result;
 }
 
@@ -1947,7 +1964,18 @@ BOOL LoadSpooferDriver() {
     DbgLog("========================================");
     DbgLog("=== HWID Spoofer Diagnostic Log ===");
     DbgLog("========================================");
-    DbgLog("Windows build: %lu", GetVersion());
+    {
+        RTL_OSVERSIONINFOW os = {0};
+        os.dwOSVersionInfoSize = sizeof(os);
+        pRtlGetVersion pRv = (pRtlGetVersion)GetProcAddress(
+            GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
+        if (pRv && pRv(&os) >= 0) {
+            DbgLog("Windows: %lu.%lu build %lu", os.dwMajorVersion, os.dwMinorVersion,
+                os.dwBuildNumber);
+        } else {
+            DbgLog("Windows: RtlGetVersion unavailable or failed");
+        }
+    }
 
     DbgLog("STAGE 1: Loading vulnerable driver...");
     if (!LoadVulnerableDriver()) {
@@ -2002,13 +2030,15 @@ BOOL LoadSpooferDriver() {
     DbgLog("STAGE 4: Mapping spoofer driver into kernel...");
     if (!KM_MapDriverFromMemory(resData, resSize)) {
         DbgLog("STAGE 4 FAIL: KM_MapDriverFromMemory returned FALSE");
-        MessageBoxA(g_hWnd, "Stage 4 failed: kernel driver mapping failed.\n\n"
-            "Possible causes:\n"
-            "- Kernel pool allocation failed\n"
-            "- Import resolution failed\n"
-            "- DriverEntry returned error\n\n"
-            "Check hwid_debug.log next to Manager.exe",
-            "Driver Error - Stage 4", MB_ICONERROR);
+        {
+            char msg[768];
+            sprintf_s(msg, sizeof(msg),
+                "Stage 4 failed: kernel mapping did not complete.\n\n%s\n\n"
+                "Full step log: hwid_debug.log next to Manager.exe",
+                g_LastMapFail[0] ? g_LastMapFail
+                    : "No detail (see log for steps 1/3/5/7).");
+            MessageBoxA(g_hWnd, msg, "Driver Error - Stage 4", MB_ICONERROR);
+        }
         UnloadVulnerableDriver();
         return FALSE;
     }

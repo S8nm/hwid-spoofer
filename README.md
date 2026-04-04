@@ -53,12 +53,12 @@ Every hardware identifier that major anti-cheat systems query is intercepted and
 | # | Vector | Kernel Method | What It Defeats |
 |---|--------|---------------|-----------------|
 | 1 | **Disk Serial Number** | `IOCTL_STORAGE_QUERY_PROPERTY` dispatch hook | WMI `Win32_DiskDrive`, most AC serial checks |
-| 2 | **SMART Drive Data** | `IOCTL_SMART_RCV_DRIVE_DATA` dispatch hook | Advanced ACs reading raw SMART identity |
+| 2 | **SMART Drive Data** | `SMART_RCV_DRIVE_DATA` (`ntdddisk.h`) dispatch hook | Advanced ACs reading raw SMART identity |
 | 3 | **ATA IDENTIFY** | `IOCTL_ATA_PASS_THROUGH` dispatch hook | ACs sending raw ATA commands |
 | 4 | **NVMe IDENTIFY** | `IOCTL_STORAGE_PROTOCOL_COMMAND` dispatch hook | NVMe drive identity queries |
 | 5 | **Disk Model / Firmware** | Patched inside storage descriptors + ATA response | Device fingerprinting |
-| 6 | **SMBIOS Tables** | Physical memory patch — Types 0, 1, 2, 3 strings + UUID | EAC, BattlEye, Vanguard, Ricochet |
-| 7 | **NIC MAC Address** | NDIS miniport dispatch hook (OID intercept) | All ACs, network fingerprinting |
+| 6 | **SMBIOS Tables** | `ZwQuerySystemInformation` (RSMB) + `NtQuerySystemInformation` inline hook — Types 0–3 strings + Type 1 UUID | EAC, BattlEye, Vanguard, Ricochet |
+| 7 | **NIC MAC Address** | NDIS dispatch hook; spoof only for known MAC-related OIDs | All ACs, network fingerprinting |
 | 8 | **NTFS Volume Serial** | `IRP_MJ_QUERY_VOLUME_INFORMATION` filesystem hook | Many ACs, Windows telemetry |
 | 9 | **BIOS Registry Keys** | `ZwSetValueKey` on `HKLM\HARDWARE\...\BIOS` | Common registry-based AC checks |
 | 10 | **GPU Adapter ID** | Registry `HardwareInformation.AdapterString` spoof | GPU-based fingerprinting |
@@ -79,9 +79,9 @@ The driver and manager are built with multiple layers of stealth to minimize det
 |-----------|-------------|
 | **Zero debug output** | No `DbgPrint`, `KdPrint`, or `DbgPrintEx` calls anywhere in the binary |
 | **MDL-based memory writes** | Uses `IoAllocateMdl` + `MmMapLockedPagesSpecifyCache` instead of toggling CR0 WP bit (which ACs detect) |
-| **Spinlock-protected hooks** | All inline hooks guarded by `KSPIN_LOCK` — thread-safe under concurrent IOCTL storms, no BSOD |
+| **Spinlock on inline hook state** | `KSPIN_LOCK` is initialized for the inline-hook structure; dispatch hooks use `InterlockedExchangePointer` on `MajorFunction` |
 | **No DriverUnload** | Mapped drivers should never expose an unload routine — prevents AC enumeration |
-| **14-byte inline hooks** | Absolute `MOV RAX + JMP RAX` patching with saved original bytes for clean call-through |
+| **14-byte inline hook (syscall)** | Only `NtQuerySystemInformation` is patched with absolute `MOV RAX + JMP RAX` + trampoline; storage/NDIS/NTFS use **driver MajorFunction pointer replacement**, not inline patches on those drivers |
 | **Obfuscated identifiers** | Short variable names, no debug strings, no function name exports |
 | **XOR-encoded driver names** | Target driver names decoded at runtime, not stored as plaintext |
 
@@ -134,8 +134,8 @@ The driver and manager are built with multiple layers of stealth to minimize det
           └───►│   Spoofer Driver    │
                │   (HelloWorld.sys)  │
                │                     │
-               │ • Hook disk dispatch│
-               │ • Patch SMBIOS      │
+               │ • Storage dispatch hook│
+               │ • RSMB + NtQuery hook│
                │ • Hook NDIS         │
                │ • Hook filesystem   │
                │ • Spoof registry    │
@@ -158,7 +158,7 @@ hwid Spoofer/
 │   │                            #   - 12 spoofing vector handlers
 │   │                            #   - Random ID generation (LCG PRNG)
 │   │                            #   - Binary log writer
-│   │                            #   - SMBIOS physical memory patcher
+│   │                            #   - SMBIOS via ZwQuerySystemInformation RSMB + Nt hook
 │   └── driver.vcxproj           # MSVC kernel-mode build config
 │
 ├── manager/
@@ -434,10 +434,10 @@ Generated: 2026-04-03 20:15:32
 `DriverEntry` executes in kernel context:
 
 1. **Generate IDs** — LCG PRNG seeded from `KeQueryPerformanceCounter`, generates all fake serials/MACs/UUIDs
-2. **Hook disk driver** — `\\Driver\\Disk` `IRP_MJ_DEVICE_CONTROL` patched with 14-byte inline hook
-3. **Hook NDIS** — `\\Driver\\ndis` `IRP_MJ_DEVICE_CONTROL` hooked for MAC address OIDs
+2. **Hook storage dispatch** — `\\Driver\\disk`, or `\\Driver\\storahci`, or `\\Driver\\stornvme` `IRP_MJ_DEVICE_CONTROL` via **MajorFunction pointer replacement** (not an inline patch on those drivers); intercepts storage IOCTLs and spoofs responses
+3. **Hook NDIS** — `\\Driver\\ndis` `IRP_MJ_DEVICE_CONTROL` and/or `IRP_MJ_INTERNAL_DEVICE_CONTROL` the same way; MAC spoofing applies only when the OID is a known address query (see driver source)
 4. **Hook filesystem** — `\\FileSystem\\Ntfs` `IRP_MJ_QUERY_VOLUME_INFORMATION` hooked for volume serial
-5. **Patch SMBIOS** — Physical memory scanned for `_SM_` anchor, Types 0/1/2/3 strings and UUID patched in-place
+5. **SMBIOS** — `ZwQuerySystemInformation` (class 76, RSMB firmware table) copies the SMBIOS table into nonpaged memory, `SpoofSMBIOS` edits Types 0–3 strings and Type 1 UUID, then an **inline 14-byte hook on `NtQuerySystemInformation`** returns the spoofed buffer to user-mode callers (no `_SM_` physical scan in this driver)
 6. **Spoof registry** — BIOS keys and GPU adapter string overwritten via `ZwSetValueKey`
 7. **Write log** — Binary struct written to `C:\ProgramData\hwid_log.bin`
 
@@ -488,10 +488,24 @@ The manager shows which stage failed. Use this table:
 | **"A driver cannot load on this device"** (Windows popup) | Vulnerable Driver Blocklist is enabled | Run: `reg add "HKLM\SYSTEM\CurrentControlSet\Control\CI\Config" /v VulnerableDriverBlocklistEnable /t REG_DWORD /d 0 /f` then reboot |
 | **"Failed to extract embedded driver files"** | AV quarantined the EXE or blocked extraction | Add exclusion for `Manager.exe` and `%TEMP%` |
 | **"Failed to open device"** | `iqvw64e.sys` loaded but device not created | Another instance may be running; reboot and retry |
-| **IDs not changing after spoof** | WMI cache or application cache | Close and reopen the application reading HWIDs |
+| **IDs not changing after spoof** | WMI / Win32 cache not refreshed | Run **cmd as Administrator**: `net stop winmgmt` then `net start winmgmt` (restarts WMI; some tools cache until then). Also close and reopen any app that displays HWIDs |
 | **Log file empty or missing** | Driver couldn't write to `C:\ProgramData` | Run as admin; check folder permissions |
 | **Some IDs revert immediately** | Application re-reads from firmware, not OS cache | Expected for firmware-level queries |
 | **BIOS/Board serial shows "(not available)"** | System firmware doesn't populate those fields | Normal on some hardware; values appear after spoofing |
+
+### WMI cache (`winmgmt`)
+
+The kernel may have updated SMBIOS and storage data, but **WMI and some Control Panel views keep cached copies** until the service refreshes. If spoofed values still do not appear in WMI-based tools after a few seconds:
+
+1. Open **Command Prompt as Administrator**.
+2. Run:
+
+```batch
+net stop winmgmt
+net start winmgmt
+```
+
+If `net stop` reports the service cannot be stopped because other services depend on it, close dependent apps or reboot, then retry. After WMI restarts, reopen your verification tool. This pattern matches what many public HWID projects document when user-mode still shows stale hardware IDs.
 
 ### Quick Diagnostic Checklist
 
@@ -549,6 +563,16 @@ The current mapper uses `iqvw64e.sys` (Intel Network Adapter Diagnostic Driver, 
 - **CPUID spoofing** — intercept processor identification instructions
 - **Monitor EDID spoofing** — display hardware fingerprint randomization
 - **Hypervisor-based hooking** — VT-x EPT hooks instead of inline patches
+
+---
+
+## Limitations (expectations)
+
+**No “always works” guarantee.** Microsoft continuously patches Windows: Memory Integrity (HVCI), Virtualization-Based Security (VBS), the **vulnerable driver blocklist**, and kernel mitigations are *intended* to stop unsigned code and known-exploit drivers. A build that works today may fail after an OS or Defender update. That is normal—not a bug you can permanently code away.
+
+**Separate two problems:** (1) **Mapping** — Stages 1–4 in the manager and `hwid_debug.log` next to `Manager.exe` show whether the vulnerable driver and kernel mapping succeeded. (2) **IDs unchanged in apps** — Often **WMI/cache** (`net stop winmgmt` / `net start winmgmt`) or software that reads **firmware/TPM/other buses**, not the paths this driver hooks.
+
+**Maintenance burden:** BYOVD-based mappers depend on specific signed drivers and IOCTL behavior; rotating or updating the loader when the blocklist changes is an ongoing engineering task, not a one-time setup.
 
 ---
 
