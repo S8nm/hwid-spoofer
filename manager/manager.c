@@ -1548,52 +1548,35 @@ static BOOL IsCanonicalKernelAddr(ULONG64 addr) {
 static ULONG64 FindPteBase() {
     if (g_PteBase) return g_PteBase;
 
-    HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
-    if (!kernel) return 0;
+    ULONG64 kernelBase = (ULONG64)g_KernelBase;
+    ULONG64 pteOffset = (kernelBase >> 12) << 3;
 
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)kernel;
-    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)((BYTE*)kernel + dos->e_lfanew);
-    BYTE* base = (BYTE*)kernel;
-    SIZE_T imgSize = nt->OptionalHeader.SizeOfImage;
+    DbgLog("  FindPteBase: probing %d PML4 indices for self-ref entry...", 256);
 
-    /*
-     * MiGetPteAddress patterns:
-     *   Pattern A: shr rax,9 / mov rcx,imm64 / add rax,rcx / ret
-     *              48 C1 E8 09 / 48 B9 [8 bytes] / 48 03 C1 / C3
-     *   Pattern B: shr rcx,9 / mov rax,imm64 / add rax,rcx / ret
-     *              48 C1 E9 09 / 48 B8 [8 bytes] / 48 03 C1 / C3
-     */
-    for (SIZE_T i = 0; i < imgSize - 20; i++) {
-        ULONG64 candidate = 0;
-        BOOL matched = FALSE;
+    for (int idx = 256; idx < 512; idx++) {
+        ULONG64 candidate = 0xFFFF000000000000ULL | ((ULONG64)idx << 39);
+        ULONG64 pteAddr = candidate + pteOffset;
 
-        if (base[i] == 0x48 && base[i+1] == 0xC1 && base[i+3] == 0x09) {
-            if (base[i+2] == 0xE8 && base[i+4] == 0x48 && base[i+5] == 0xB9 &&
-                base[i+14] == 0x48 && base[i+15] == 0x03 && base[i+16] == 0xC1) {
-                candidate = *(ULONG64*)(base + i + 6);
-                matched = TRUE;
+        if (!IsCanonicalKernelAddr(pteAddr)) continue;
+
+        ULONG64 pte = 0;
+        if (!KM_ReadKernelMemory(pteAddr, &pte, sizeof(pte))) continue;
+
+        if ((pte & 1) && (pte & 0xFFFFFFFFFF000ULL)) {
+            ULONG64 testAddr2 = candidate + (((kernelBase + 0x1000) >> 12) << 3);
+            ULONG64 pte2 = 0;
+            if (KM_ReadKernelMemory(testAddr2, &pte2, sizeof(pte2)) &&
+                (pte2 & 1) && (pte2 & 0xFFFFFFFFFF000ULL)) {
+                g_PteBase = candidate;
+                DbgLog("  FindPteBase: found PTE_BASE=0x%llX (PML4 idx=%d)", candidate, idx);
+                DbgLog("  FindPteBase: verify PTE[KernelBase]=0x%llX PTE[KernelBase+0x1000]=0x%llX",
+                    pte, pte2);
+                return g_PteBase;
             }
-            else if (base[i+2] == 0xE9 && base[i+4] == 0x48 && base[i+5] == 0xB8 &&
-                     base[i+14] == 0x48 && base[i+15] == 0x03 && base[i+16] == 0xC1) {
-                candidate = *(ULONG64*)(base + i + 6);
-                matched = TRUE;
-            }
-        }
-
-        if (matched && IsCanonicalKernelAddr(candidate)) {
-            g_PteBase = candidate;
-            DbgLog("  FindPteBase: found at offset 0x%llX, PTE_BASE=0x%llX",
-                (ULONG64)i, g_PteBase);
-            FreeLibrary(kernel);
-            return g_PteBase;
-        } else if (matched) {
-            DbgLog("  FindPteBase: rejected non-canonical match at 0x%llX = 0x%llX",
-                (ULONG64)i, candidate);
         }
     }
 
-    FreeLibrary(kernel);
-    DbgLog("  FindPteBase: no valid MiGetPteAddress pattern found in ntoskrnl");
+    DbgLog("  FindPteBase FAIL: no valid PML4 self-ref index found");
     return 0;
 }
 
