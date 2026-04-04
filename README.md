@@ -22,6 +22,7 @@ Randomizes every hardware fingerprint that modern anti-cheat systems read, in un
 - [Build Instructions](#build-instructions)
 - [Usage](#usage)
 - [Runtime Requirements](#runtime-requirements)
+- [Setup Guide](#setup-guide)
 - [ID Logging](#id-logging)
 - [How It Works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
@@ -232,8 +233,9 @@ This single file is everything you need. No DLLs, no config files, no runtime de
 
 ### First Run
 
-1. **Disable Memory Integrity** — Windows Security → Device Security → Core Isolation → Memory Integrity → **Off** → Reboot
-2. Run `Manager.exe` as **Administrator** (right-click → Run as administrator)
+1. **Complete the [Setup Guide](#setup-guide)** — disable VBS, HVCI, and the driver blocklist, then reboot
+2. **Verify your setup** — run the [Quick Diagnostic Checklist](#quick-diagnostic-checklist) to confirm all values are 0
+3. Run `Manager.exe` as **Administrator** (right-click → Run as administrator)
 
 ### Spoofing
 
@@ -266,10 +268,78 @@ Closing `Manager.exe` triggers automatic cleanup:
 |-------------|---------|
 | **OS** | Windows 10 or 11, 64-bit |
 | **Privileges** | Administrator (UAC elevation required) |
-| **Memory Integrity** | Must be **disabled** (HVCI blocks vulnerable driver loading) |
+| **VBS / HVCI** | Must be **fully disabled** — see [Setup Guide](#setup-guide) below |
 | **Secure Boot** | Can remain **enabled** (DSE bypass is via signed driver, not boot modification) |
 | **Antivirus** | May need exclusion for `Manager.exe` (some AVs flag KDMapper behavior) |
 | **Disk** | ~1MB free in `%TEMP%` (briefly, during driver extraction) |
+
+---
+
+## Setup Guide
+
+> **You MUST complete all steps below before running the spoofer.** Skipping any step will result in a BSOD (blue screen) or a "failed to load driver" error.
+
+### Step 1: Disable Memory Integrity (HVCI)
+
+1. Open **Windows Security** (search in Start Menu)
+2. Click **Device security**
+3. Click **Core isolation details**
+4. Turn **OFF** "Memory integrity"
+5. **Do not reboot yet** — complete all steps first
+
+### Step 2: Disable Virtualization-Based Security (VBS)
+
+Open **Command Prompt as Administrator** (right-click Start → Terminal (Admin)) and run:
+
+```batch
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard" /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 0 /f
+
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" /v Enabled /t REG_DWORD /d 0 /f
+```
+
+### Step 3: Disable the Vulnerable Driver Blocklist
+
+Still in the admin Command Prompt:
+
+```batch
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\CI\Config" /v VulnerableDriverBlocklistEnable /t REG_DWORD /d 0 /f
+```
+
+### Step 4: Reboot
+
+**Reboot is mandatory.** VBS runs at the hypervisor level and persists until restart.
+
+### Step 5: Verify VBS is actually off
+
+After rebooting, open PowerShell and run:
+
+```powershell
+(Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard').VirtualizationBasedSecurityStatus
+```
+
+| Output | Meaning | Action |
+|--------|---------|--------|
+| **0** | VBS is off | You're good — run the spoofer |
+| **1** | VBS is configured but not running | Should work — try the spoofer |
+| **2** | VBS is **still running** | See [VBS won't disable](#vbs-wont-disable) below |
+
+### If VBS won't disable
+
+On some systems (especially Windows 11 24H2+), VBS is enforced through Hyper-V. Run in admin Command Prompt:
+
+```batch
+bcdedit /set hypervisorlaunchtype off
+```
+
+Reboot and verify again. If VBS status is still 2, also try:
+
+```batch
+bcdedit /set vsmlaunchtype off
+```
+
+Reboot once more. VBS status must be 0 or 1 before the spoofer will work.
+
+> **Why is this necessary?** VBS runs a hypervisor underneath Windows that enforces Kernel Data Protection (KDP) and HVCI. These make kernel memory read-only at the hardware level — no code change can bypass this. The spoofer needs direct kernel memory access to install hooks and map the driver.
 
 ---
 
@@ -381,16 +451,76 @@ Generated: 2026-04-03 20:15:32
 
 ## Troubleshooting
 
+### BSOD: PAGE_FAULT_IN_NONPAGED_AREA (0x50)
+
+**This is the most common issue.** The crash happens inside the vulnerable driver when it tries to access protected kernel memory.
+
+| "What failed" on BSOD | Root Cause | Fix |
+|------------------------|------------|-----|
+| A `.tmp` file | VBS/HVCI is still running | Complete the [Setup Guide](#setup-guide) — VBS status must be 0 |
+| `ntoskrnl.exe` | Kernel address calculation failed | Reboot and retry; if persistent, file an issue |
+| `CI.dll` | Code Integrity blocking unsigned code | Disable HVCI and reboot |
+
+**How to confirm VBS is the problem:**
+
+```powershell
+(Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard').VirtualizationBasedSecurityStatus
+```
+
+If this returns **2**, VBS is running and **no code fix can solve the crash**. You must disable VBS first.
+
+### Stage-Specific Errors
+
+The manager shows which stage failed. Use this table:
+
+| Error | Stage | Cause | Solution |
+|-------|-------|-------|----------|
+| **"Stage 1 failed" (error 1275)** | Driver load | Memory Integrity blocks the vulnerable driver | Disable HVCI + vulnerable driver blocklist, reboot |
+| **"Stage 1 failed" (error 577)** | Driver load | Driver Signature Enforcement | Verify `iqvw64e.sys` binary is the correct signed version |
+| **"Stage 2 failed"** | Kernel base | `EnumDeviceDrivers` returned wrong base | Reboot and retry; check if antivirus is interfering |
+| **"Stage 3 failed"** | Resource load | Spoofer driver resource missing from EXE | Rebuild from source; the EXE may be corrupted |
+| **"Stage 4 failed"** | Kernel mapping | Pool allocation, import resolution, or DriverEntry failed | Verify VBS is off; check for AV interference |
+
+### Other Issues
+
 | Problem | Cause | Solution |
 |---------|-------|----------|
-| **"Failed to start service" (error 1275)** | Memory Integrity / HVCI is enabled | Disable in Windows Security → Core Isolation |
-| **"Driver signature verification failed" (error 577)** | Uncommon — DSE blocking Intel driver | Verify `iqvw64e.sys` is the correct signed binary |
+| **"A driver cannot load on this device"** (Windows popup) | Vulnerable Driver Blocklist is enabled | Run: `reg add "HKLM\SYSTEM\CurrentControlSet\Control\CI\Config" /v VulnerableDriverBlocklistEnable /t REG_DWORD /d 0 /f` then reboot |
 | **"Failed to extract embedded driver files"** | AV quarantined the EXE or blocked extraction | Add exclusion for `Manager.exe` and `%TEMP%` |
 | **"Failed to open device"** | `iqvw64e.sys` loaded but device not created | Another instance may be running; reboot and retry |
-| **BSOD during spoofing** | Hook collision with AV kernel driver | Disable real-time AV protection before running |
 | **IDs not changing after spoof** | WMI cache or application cache | Close and reopen the application reading HWIDs |
 | **Log file empty or missing** | Driver couldn't write to `C:\ProgramData` | Run as admin; check folder permissions |
-| **Some IDs revert immediately** | Application re-reads from firmware, not OS cache | Expected for firmware-level queries (planned fix) |
+| **Some IDs revert immediately** | Application re-reads from firmware, not OS cache | Expected for firmware-level queries |
+| **BIOS/Board serial shows "(not available)"** | System firmware doesn't populate those fields | Normal on some hardware; values appear after spoofing |
+
+### Quick Diagnostic Checklist
+
+Run these in an admin PowerShell to check your system:
+
+```powershell
+# 1. VBS status (must be 0)
+Write-Host "VBS Status:" (Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard').VirtualizationBasedSecurityStatus
+
+# 2. HVCI registry (must be 0)
+Write-Host "HVCI Enabled:" (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -ErrorAction SilentlyContinue).Enabled
+
+# 3. VBS registry (must be 0)
+Write-Host "VBS Enabled:" (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard' -ErrorAction SilentlyContinue).EnableVirtualizationBasedSecurity
+
+# 4. Driver blocklist (must be 0)
+Write-Host "Blocklist:" (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config' -ErrorAction SilentlyContinue).VulnerableDriverBlocklistEnable
+```
+
+**Expected output for a working setup:**
+
+```
+VBS Status: 0
+HVCI Enabled: 0
+VBS Enabled: 0
+Blocklist: 0
+```
+
+If any value is 1 or 2, follow the [Setup Guide](#setup-guide) steps for that item and reboot.
 
 ---
 
