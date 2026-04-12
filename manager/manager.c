@@ -1749,32 +1749,46 @@ static BOOL KM_IsCanonicalKernelVa(ULONG64 va) {
     return (va >= 0xFFFF800000000000ULL && va <= 0xFFFFFFFFFFFFFFFFULL);
 }
 
+/* Return TRUE iff v looks like a valid KASLR'd PTE_BASE:
+ *   - canonical kernel address (top 17 bits all 1)
+ *   - lower 39 bits zero (PTE_BASE = PML4-index * 2^39, sign-extended)
+ *   - in the Windows kernel-half PML4 range (indices 256..511)
+ */
+static BOOL KM_LooksLikePteBase(ULONG64 v) {
+    if ((v >> 47) != 0x1FFFF)        return FALSE; /* not canonical kernel */
+    if (v & 0x7FFFFFFFFFULL)         return FALSE; /* lower 39 bits non-zero */
+    if (v < 0xFFFF800000000000ULL)   return FALSE; /* below PML4 index 256 */
+    if (v > 0xFFFFFF8000000000ULL)   return FALSE; /* above  PML4 index 511 */
+    return TRUE;
+}
+
 /*
  * Scan the RUNNING ntoskrnl kernel image (read via case 0x33) for the MiGetPteAddress
  * byte pattern to recover the KASLR'd PTE_BASE at runtime.
  *
  * Why the running image, not the on-disk file:
- *   PTE_BASE is chosen randomly at each boot and patched into kernel code/data.
- *   The ntoskrnl.exe PE file on disk holds placeholder zeros; only the live kernel
- *   has the actual value.
+ *   PTE_BASE is randomised at boot and patched into the live kernel.  The PE file
+ *   on disk holds placeholder zeros, so a user-mode scan always returns nothing.
  *
- * Two compiler variants handled:
- *   A) REX.W MOV Reg, imm64  — PTE_BASE embedded as an 8-byte immediate after boot-patch
- *        48/49 B8..BF  xx xx xx xx xx xx xx xx
- *   B) REX.W ADD Rn, [RIP+disp32] — PTE_BASE in a .data slot; follow the RIP reference
- *        48/4C 03 /r (mod=00 rm=101)  xx xx xx xx
+ * Anchor: any REX.W SAR/SHR r64, 9  — bits: (48|49) C1 (E8-EF|F8-FF) 09
+ *   This is the only instruction needed to compute a PTE index from a VA and appears
+ *   at the start of MiGetPteAddress on every known x64 Windows 10/11 build.
+ *   Searching 160 bytes both before and after the anchor covers all known orderings.
  *
- * Anchor: 48 C1 F9 09  (sar rcx, 9) — opening instruction of every known
- * MiGetPteAddress implementation on x64 Windows 10 1803 through 11 24H2.
+ * Two value-encoding variants handled:
+ *   A) REX.W MOV Rn, imm64  — PTE_BASE baked directly into the instruction
+ *   B) REX.W ADD/MOV Rn, [RIP+disp32] — PTE_BASE in a .data slot; follow reference
  *
- * Safety: only non-discardable executable sections are scanned (skips freed INIT
- * and pageable PAGE* sections that might fault via case 0x33).
+ * Safety: only IMAGE_SCN_MEM_DISCARDABLE (freed INIT) sections are skipped —
+ * those VAs are genuinely unmapped after init and would fault case 0x33.
+ * PAGE and PAGELK sections are included: PAGELK is page-locked (non-pageable);
+ * PAGE sections can soft-page-in at PASSIVE_LEVEL, which is safe.
  */
 static ULONG64 KM_ScanKernelImageForPteBase(void) {
     ULONG64 kbase = (ULONG64)g_KernelBase;
     if (!kbase) return 0;
 
-    BYTE hdr[0x1000];
+    BYTE hdr[0x2000];
     if (!KM_ReadKernelMemory(kbase, hdr, sizeof(hdr))) return 0;
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hdr;
@@ -1785,25 +1799,23 @@ static ULONG64 KM_ScanKernelImageForPteBase(void) {
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
 
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    WORD   nsec   = nt->FileHeader.NumberOfSections;
+    WORD   nsec    = nt->FileHeader.NumberOfSections;
     ULONG64 pteBase = 0;
 
-    const DWORD CHUNK   = 0x8000;   /* 32 KB read per IOCTL */
-    const DWORD OVERLAP = 96;       /* back-up to catch cross-boundary patterns */
+    const DWORD CHUNK   = 0x8000;  /* 32 KB per IOCTL */
+    const DWORD OVERLAP = 200;     /* bytes backed-up between chunks (covers 160-byte window) */
     BYTE* buf = (BYTE*)malloc(CHUNK);
     if (!buf) return 0;
 
     WORD i;
     for (i = 0; i < nsec && !pteBase; i++) {
         DWORD chars = sec[i].Characteristics;
-        if (!(chars & IMAGE_SCN_MEM_EXECUTE))    continue; /* not code */
-        if (chars & IMAGE_SCN_MEM_DISCARDABLE)   continue; /* freed INIT */
-        /* Skip PAGE* sections (pageable, might not be resident) */
-        if (strncmp((char*)sec[i].Name, "PAGE", 4) == 0) continue;
+        if (!(chars & IMAGE_SCN_MEM_EXECUTE))  continue; /* not code */
+        if (chars & IMAGE_SCN_MEM_DISCARDABLE) continue; /* freed INIT — truly unmapped */
 
         ULONG64 secVA   = kbase + sec[i].VirtualAddress;
         DWORD   secSize = sec[i].Misc.VirtualSize;
-        if (secSize > 0x1400000) secSize = 0x1400000; /* 20 MB cap */
+        if (secSize < 4 || secSize > 0x1800000) continue; /* sanity: skip empty / >24 MB */
 
         DWORD off = 0;
         while (off < secSize && !pteBase) {
@@ -1811,56 +1823,61 @@ static ULONG64 KM_ScanKernelImageForPteBase(void) {
             if (rdSz > CHUNK) rdSz = CHUNK;
 
             if (!KM_ReadKernelMemory(secVA + off, buf, rdSz)) {
-                off += rdSz;
+                off += rdSz; /* skip unreadable chunk and continue */
                 continue;
             }
 
             DWORD j;
             for (j = 0; j + 4 <= rdSz && !pteBase; j++) {
-                /* anchor: sar rcx, 9 */
-                if (buf[j] != 0x48 || buf[j+1] != 0xC1 ||
-                    buf[j+2] != 0xF9 || buf[j+3] != 0x09)
-                    continue;
+                BYTE b0 = buf[j], b1 = buf[j+1], b2 = buf[j+2], b3 = buf[j+3];
 
-                DWORD klim = j + 80;
-                if (klim > rdSz) klim = rdSz;
+                /* Anchor: REX.W SAR or SHR r64, 9
+                   Encoding: (0x48|0x49) 0xC1 (0xE8..0xEF | 0xF8..0xFF) 0x09 */
+                if (b3 != 0x09) continue;
+                if (b1 != 0xC1) continue;
+                if (b0 != 0x48 && b0 != 0x49) continue;
+                if (!((b2 >= 0xE8 && b2 <= 0xEF) || (b2 >= 0xF8 && b2 <= 0xFF))) continue;
+
+                /* Search window: 160 bytes before anchor + 160 bytes after */
+                DWORD wstart = (j >= 160) ? j - 160 : 0;
+                DWORD wend   = j + 4 + 160;
+                if (wend > rdSz) wend = rdSz;
+
                 DWORD k;
-                for (k = j + 4; k < klim && !pteBase; k++) {
-                    BYTE b0 = buf[k], b1 = (k+1 < rdSz ? buf[k+1] : 0);
+                for (k = wstart; k < wend && !pteBase; k++) {
+                    if (k + 2 >= rdSz) break;
+                    BYTE c0 = buf[k], c1 = buf[k+1];
 
-                    /* Variant A: REX.W MOV Reg, imm64  (10 bytes) */
+                    /* Variant A: REX.W MOV Rn, imm64  (10 bytes total) */
                     if (k + 10 <= rdSz &&
-                        (b0 == 0x48 || b0 == 0x49) && b1 >= 0xB8 && b1 <= 0xBF) {
+                        (c0 == 0x48 || c0 == 0x49) && c1 >= 0xB8 && c1 <= 0xBF) {
                         ULONG64 cand = 0;
                         memcpy(&cand, &buf[k+2], 8);
-                        if ((cand >> 47) == 0x1FFFF && !(cand & 7) &&
-                            cand != 0x7FFFFFFFF8ULL &&
-                            cand >= 0xFFFF800000000000ULL)
+                        if (KM_LooksLikePteBase(cand))
                             pteBase = cand;
                         continue;
                     }
 
-                    /* Variant B: REX.W ADD Rn, [RIP+disp32]  (7 bytes)
-                       Encoding: (48|4C) 03 ModRM disp32  where ModRM & 0xC7 == 0x05 */
-                    if (k + 7 <= rdSz &&
-                        (b0 == 0x48 || b0 == 0x4C) && b1 == 0x03 &&
-                        (k+2 < rdSz) && ((buf[k+2] & 0xC7) == 0x05)) {
+                    /* Variant B: REX.W ADD/MOV Rn, [RIP+disp32]  (7 bytes)
+                       REX.W ADD: (48|4C) 03 (ModRM & 0xC7 == 0x05)
+                       REX.W MOV: (48|4C) 8B (ModRM & 0xC7 == 0x05) */
+                    if (k + 7 <= rdSz && (c0 == 0x48 || c0 == 0x4C) &&
+                        (c1 == 0x03 || c1 == 0x8B) &&
+                        ((buf[k+2] & 0xC7) == 0x05)) {
                         INT32 disp32 = 0;
                         memcpy(&disp32, &buf[k+3], 4);
-                        ULONG64 instrVA = secVA + off + k;
+                        ULONG64 instrVA  = secVA + off + k;
                         ULONG64 targetVA = (ULONG64)((LONG64)(instrVA + 7) + disp32);
                         if (KM_IsCanonicalKernelVa(targetVA)) {
                             ULONG64 cand = 0;
                             if (KM_ReadKernelMemory(targetVA, &cand, 8) &&
-                                (cand >> 47) == 0x1FFFF && !(cand & 7) &&
-                                cand >= 0xFFFF800000000000ULL)
+                                KM_LooksLikePteBase(cand))
                                 pteBase = cand;
                         }
                     }
                 }
             }
 
-            /* advance with overlap so patterns crossing chunk boundary aren't missed */
             off += (rdSz > OVERLAP) ? (rdSz - OVERLAP) : rdSz;
         }
     }
