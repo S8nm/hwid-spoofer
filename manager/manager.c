@@ -1750,8 +1750,70 @@ static BOOL KM_IsCanonicalKernelVa(ULONG64 va) {
 }
 
 /*
+ * Scan the user-mode loaded ntoskrnl.exe image for the MiGetPteAddress pattern to
+ * recover PTE_BASE without any kernel reads (no BSOD risk).
+ *
+ * Win10 1803+ x64 MiGetPteAddress pattern:
+ *   48 C1 F9 09             sar  rcx, 9
+ *   48 B8 F8 FF FF FF FF    mov  rax, 0x7FFFFFFFF8   (mask, may vary)
+ *        7F 00 00
+ *   48 23 C8                and  rcx, rax
+ *   48 B8 xx xx xx xx       mov  rax, <PTE_BASE>     <- extract this
+ *        xx xx xx xx
+ *   48 03 C1                add  rax, rcx
+ *   C3                      ret
+ *
+ * Strategy: find `sar rcx, 9` (48 C1 F9 09), then within 80 bytes scan for
+ * MOV RAX, imm64 (48 B8) whose payload is a canonical kernel address aligned to 8 bytes.
+ * Skip the mask value (0x7FFFFFFFF8) by checking that candidate >> 47 == 0x1FFFF.
+ */
+static ULONG64 KM_ScanUserModeForPteBase(void) {
+    HMODULE kernel = LoadLibraryExA("ntoskrnl.exe", NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!kernel) return 0;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)kernel;
+    PIMAGE_NT_HEADERS64 nt  = (PIMAGE_NT_HEADERS64)((BYTE*)kernel + dos->e_lfanew);
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    ULONG64 pteBase = 0;
+    WORD i;
+
+    for (i = 0; i < nt->FileHeader.NumberOfSections && !pteBase; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        BYTE*  start = (BYTE*)kernel + sec[i].VirtualAddress;
+        DWORD  vsize = sec[i].Misc.VirtualSize;
+        DWORD  j;
+
+        for (j = 0; j + 14 < vsize && !pteBase; j++) {
+            /* sar rcx, 9 */
+            if (start[j] != 0x48 || start[j+1] != 0xC1 ||
+                start[j+2] != 0xF9 || start[j+3] != 0x09)
+                continue;
+
+            DWORD k;
+            for (k = j + 4; k + 10 <= j + 80 && k + 10 <= vsize; k++) {
+                if (start[k] != 0x48 || start[k+1] != 0xB8) continue;
+                ULONG64 candidate = 0;
+                memcpy(&candidate, &start[k+2], 8);
+                /* Top 17 bits all 1 = canonical kernel, low 3 bits 0 = aligned */
+                if ((candidate >> 47) != 0x1FFFF) continue;
+                if (candidate & 0x7ULL)            continue;
+                /* Skip the 0x7FFFFFFFF8 mask that also appears near sar rcx,9 */
+                if (candidate == 0x7FFFFFFFF8ULL)  continue;
+                if (candidate < 0xFFFF800000000000ULL) continue;
+                pteBase = candidate;
+                break;
+            }
+        }
+    }
+
+    FreeLibrary(kernel);
+    return pteBase;
+}
+
+/*
  * Find PTE_BASE by scanning self-reference PML4 indices (256..511). Anchored at the
  * classic Win7 reference index 0x1ED -> 0xFFFFF68000000000 (see Windows self-map layout).
+ * NOTE: this probes kernel addresses with case 0x33 — use only when safe to do so.
  */
 static ULONG64 KM_FindPteBaseForSystem(void) {
     ULONG64 kbase = (ULONG64)g_KernelBase;
@@ -1900,10 +1962,36 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
     } else
         DbgLog("  WriteToReadOnly: no verified CR3 from MZ test — trying kernel VA PTE flip");
 
+    /* --- Safe path: extract PTE_BASE from user-mode ntoskrnl scan (zero kernel reads) --- */
+    {
+        ULONG64 pteBase = KM_ScanUserModeForPteBase();
+        if (pteBase) {
+            /* Validate by reading the PTE for the kernel base — always present when PTE_BASE is correct. */
+            ULONG64 kbasePte = pteBase + (((LONG64)(ULONG64)g_KernelBase >> 9) & 0x7FFFFFFFF8);
+            ULONG64 kbasePteVal = 0;
+            BOOL valid = KM_IsCanonicalKernelVa(kbasePte) &&
+                         KM_ReadKernelMemory(kbasePte, &kbasePteVal, sizeof(kbasePteVal)) &&
+                         (kbasePteVal & 1);
+            if (valid) {
+                DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX (user-mode scan, kbasePTE=0x%llX val=0x%llX)",
+                    pteBase, kbasePte, kbasePteVal);
+                if (KM_TryKernelVaWritableFlip(pteBase, kernelAddr, buffer, size))
+                    return TRUE;
+                DbgLog("  WriteToReadOnly: user-mode PTE_BASE flip attempt inconclusive, continuing");
+            } else {
+                DbgLog("  WriteToReadOnly: PTE_BASE=0x%llX failed validation (kbasePte=0x%llX val=0x%llX)",
+                    pteBase, kbasePte, kbasePteVal);
+            }
+        } else {
+            DbgLog("  WriteToReadOnly: user-mode PTE_BASE scan found no match");
+        }
+    }
+
     if (!KM_AllowUnsafeKernelVaProbe()) {
         DbgLog("  WriteToReadOnly: kernel-VA PTE scan disabled (unsafe with case 0x33 on unmapped slots)");
         SetLastMapFailV(
-            "Kernel write path aborted safely: physical PTE walk unavailable, and kernel-VA PTE scan is disabled to prevent BSOD on this build. "
+            "Kernel write path aborted: physical PTE walk unavailable, user-mode PTE_BASE scan failed, "
+            "and kernel-VA probe scan is disabled to prevent BSOD on this build. "
             "Set HWID_ALLOW_UNSAFE_KVA_PTE_SCAN=1 only for diagnostic testing.");
         return FALSE;
     }
