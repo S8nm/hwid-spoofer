@@ -2,11 +2,20 @@
  * System component - hardware abstraction layer
  */
 
-#include <ntddk.h>
+/*
+ * ntifs.h is a strict superset of ntddk.h/wdm.h and is required for
+ * SECURITY_DESCRIPTOR used by hwid_comm.c. Mixing ntddk.h (here) with
+ * ntifs.h (in hwid_comm.h) in the same translation unit triggers
+ * C2371 PEPROCESS/PETHREAD redefinition, so both must use ntifs.h.
+ */
+#include <ntifs.h>
 #include <ntddstor.h>
 #include <ntdddisk.h>
 #include <ntddscsi.h>
 #include <ntstrsafe.h>
+
+#include "hwid_comm.h"
+#include "../shared/hwid_protocol.h"
 
 extern POBJECT_TYPE *IoDriverObjectType;
 extern NTSTATUS NTAPI ObReferenceObjectByName(
@@ -112,21 +121,11 @@ typedef struct _FW_TABLE_INFO {
     UCHAR TableBuffer[1];
 } FW_TABLE_INFO;
 
-#pragma pack(push, 1)
-typedef struct _IDLOG {
-    CHAR Sig[8];
-    CHAR ODs[64]; CHAR FDs[64];
-    CHAR OBs[64]; CHAR FBs[64];
-    CHAR OMs[64]; CHAR FMs[64];
-    CHAR OUu[48]; CHAR FUu[48];
-    UCHAR OMc[6]; UCHAR FMc[6];
-    ULONG OVs;    ULONG FVs;
-    CHAR OGp[64]; CHAR FGp[64];
-    CHAR OMn[48]; CHAR FMn[48];
-    CHAR OFr[16]; CHAR FFr[16];
-    CHAR OSmbMb[64]; /* SMBIOS Type 2 board string (before spoof); OMs = registry BaseBoard only */
-} IDLOG;
-#pragma pack(pop)
+/* Shared ID log layout is now defined in shared/hwid_protocol.h as
+ * HWID_ID_LOG and lives inside g_HwidShared.log (see hwid_comm.h).
+ * A thin macro aliases the old g_Log usages to the new location so the
+ * hook/spoof logic below does not need structural changes. */
+#define g_Log  (g_HwidShared.log)
 
 typedef NTSTATUS (*FnDispatch)(PDEVICE_OBJECT, PIRP);
 typedef NTSTATUS (NTAPI *FnNtQuerySysInfo)(ULONG, PVOID, ULONG, PULONG);
@@ -155,7 +154,6 @@ static PKEVENT g_pRevertEvent    = NULL;
 static CHAR g_OrigBV[64] = {0};
 static CHAR g_OrigPN[48] = {0};
 
-static IDLOG g_Log  = {0};
 static BOOLEAN g_Logged = FALSE;
 
 // ==================== PROTOTYPES ====================
@@ -213,7 +211,7 @@ static BOOLEAN HookInstall(PVOID target, PVOID detour, PIH h) {
     h->Orig = target;
     h->Det = detour;
 
-    PVOID tramp = ExAllocatePoolWithTag(NonPagedPoolExecute, 32, 'prmT');
+    PVOID tramp = ExAllocatePool2(POOL_FLAG_NON_PAGED_EXECUTE, 32, 'prmT');
     if (!tramp) return FALSE;
 
     RtlCopyMemory(tramp, h->SavedBytes, 14);
@@ -368,41 +366,24 @@ static VOID GenAllIDs() {
 
 // ==================== LOG ====================
 
-static VOID WriteLog() {
-    RtlCopyMemory(g_Log.Sig, "HWIDLOG", 8);
-    RtlCopyMemory(g_Log.FDs, g_DS, 64);
-    RtlCopyMemory(g_Log.FBs, g_BS, 64);
-    RtlCopyMemory(g_Log.FMs, g_MB, 64);
-    RtlCopyMemory(g_Log.FMc, g_MC, 6);
-    g_Log.FVs = g_VS;
-    RtlCopyMemory(g_Log.FGp, g_GP, 64);
-    RtlCopyMemory(g_Log.FMn, g_MN, 48);
-    RtlCopyMemory(g_Log.FFr, g_FR, 16);
+/*
+ * Populate the fake-side fields of the shared ID log and publish the
+ * shared block via hwid_comm. Originals are filled progressively by the
+ * hook handlers (the first time they observe a real value).
+ */
+static VOID PublishLog(VOID) {
+    RtlCopyMemory(g_Log.FakeDiskSerial,   g_DS, 64);
+    RtlCopyMemory(g_Log.FakeBIOSSerial,   g_BS, 64);
+    RtlCopyMemory(g_Log.FakeBoardSerial,  g_MB, 64);
+    RtlCopyMemory(g_Log.FakeMAC,          g_MC, 6);
+    g_Log.FakeVolumeSerial = g_VS;
+    RtlCopyMemory(g_Log.FakeGPUId,        g_GP, 64);
+    RtlCopyMemory(g_Log.FakeModelNumber,  g_MN, 48);
+    RtlCopyMemory(g_Log.FakeFirmwareRev,  g_FR, 16);
+    FormatUUID(g_Log.FakeSystemUUID, 48, g_UU);
 
-    FormatUUID(g_Log.FUu, 48, g_UU);
-
-    UNICODE_STRING fp;
-    OBJECT_ATTRIBUTES oa;
-    IO_STATUS_BLOCK io;
-    HANDLE hf;
-    NTSTATUS createSt;
-
-    RtlInitUnicodeString(&fp, L"\\??\\C:\\ProgramData\\hwid_log.bin");
-    InitializeObjectAttributes(&oa, &fp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    createSt = ZwCreateFile(&hf, GENERIC_WRITE | SYNCHRONIZE, &oa, &io,
-        NULL, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, 0, FILE_OVERWRITE_IF,
-        FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
-    if (!NT_SUCCESS(createSt)) {
-        RtlInitUnicodeString(&fp, L"\\??\\C:\\Windows\\Temp\\hwid_log.bin");
-        InitializeObjectAttributes(&oa, &fp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-        createSt = ZwCreateFile(&hf, GENERIC_WRITE | SYNCHRONIZE, &oa, &io,
-            NULL, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM, 0, FILE_OVERWRITE_IF,
-            FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
-    }
-    if (NT_SUCCESS(createSt)) {
-        ZwWriteFile(hf, NULL, NULL, NULL, &io, &g_Log, sizeof(IDLOG), NULL, NULL);
-        ZwClose(hf);
-    }
+    HwidComm_SetStatus(HWID_STATUS_READY);
+    HwidComm_Publish();
     g_Logged = TRUE;
 }
 
@@ -450,7 +431,7 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
         if (hdr->Type == 1 && hdr->Length >= 0x19) {
             if (data + 0x08 + 16 <= end) {
                 if (!g_Logged)
-                    FormatUUID(g_Log.OUu, 48, &data[8]);
+                    FormatUUID(g_Log.OrigSystemUUID, 48, &data[8]);
                 RtlCopyMemory(data + 0x08, g_UU, 16);
             }
             UCHAR idx = data[0x07];
@@ -460,10 +441,10 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
                 SIZE_T sl = SafeStrLen(sp, end);
                 if (sl == 0) break;
                 if (num == idx) {
-                    if (!g_Logged && !g_Log.OBs[0]) {
+                    if (!g_Logged && !g_Log.OrigBIOSSerial[0]) {
                         SIZE_T cl = min(sl, (SIZE_T)63);
-                        RtlCopyMemory(g_Log.OBs, sp, cl);
-                        g_Log.OBs[cl] = '\0';
+                        RtlCopyMemory(g_Log.OrigBIOSSerial, sp, cl);
+                        g_Log.OrigBIOSSerial[cl] = '\0';
                     }
                     ReplaceString(sp, sl, g_BS);
                 }
@@ -480,7 +461,7 @@ static VOID SpoofSMBIOS(PUCHAR buffer, ULONG length) {
                 if (sl == 0) break;
                 if (num == idx) {
                     if (!g_Logged)
-                        RtlCopyMemory(g_Log.OSmbMb, sp, min(sl, 63));
+                        RtlCopyMemory(g_Log.OrigSmbBoardSerial, sp, min(sl, 63));
                     ReplaceString(sp, sl, g_MB);
                 }
                 sp += sl + 1; num++;
@@ -525,21 +506,21 @@ static VOID SpoofStorageQP(PVOID buf, ULONG_PTR len) {
         PCHAR s = (PCHAR)((PUCHAR)d + d->SerialNumberOffset);
         SIZE_T ml = len - d->SerialNumberOffset;
         SIZE_T slen = BoundedStrLen(s, ml);
-        if (!g_Logged) RtlCopyMemory(g_Log.ODs, s, min(slen, 63));
+        if (!g_Logged) RtlCopyMemory(g_Log.OrigDiskSerial, s, min(slen, 63));
         if (ml > strlen(g_DS)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_DS, strlen(g_DS)); }
     }
     if (d->ProductIdOffset > 0 && d->ProductIdOffset < len) {
         PCHAR s = (PCHAR)((PUCHAR)d + d->ProductIdOffset);
         SIZE_T ml = len - d->ProductIdOffset;
         SIZE_T slen = BoundedStrLen(s, ml);
-        if (!g_Logged) RtlCopyMemory(g_Log.OMn, s, min(slen, 47));
+        if (!g_Logged) RtlCopyMemory(g_Log.OrigModelNumber, s, min(slen, 47));
         if (ml > strlen(g_MN)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_MN, strlen(g_MN)); }
     }
     if (d->ProductRevisionOffset > 0 && d->ProductRevisionOffset < len) {
         PCHAR s = (PCHAR)((PUCHAR)d + d->ProductRevisionOffset);
         SIZE_T ml = len - d->ProductRevisionOffset;
         SIZE_T slen = BoundedStrLen(s, ml);
-        if (!g_Logged) RtlCopyMemory(g_Log.OFr, s, min(slen, 15));
+        if (!g_Logged) RtlCopyMemory(g_Log.OrigFirmwareRev, s, min(slen, 15));
         if (ml > strlen(g_FR)) { RtlZeroMemory(s, ml); RtlCopyMemory(s, g_FR, strlen(g_FR)); }
     }
 }
@@ -662,7 +643,7 @@ static VOID SpoofNdisMacOutput(PIRP irp) {
     if (!ok)
         return;
     if (!g_Logged)
-        RtlCopyMemory(g_Log.OMc, mac, 6);
+        RtlCopyMemory(g_Log.OrigMAC, mac, 6);
     RtlCopyMemory(mac, g_MC, 6);
 }
 
@@ -699,7 +680,7 @@ NTSTATUS HkFs(PDEVICE_OBJECT dev, PIRP irp) {
         irp->IoStatus.Information >= sizeof(FS_VOL_INFO)) {
         FS_VOL_INFO* vi = (FS_VOL_INFO*)irp->AssociatedIrp.SystemBuffer;
         if (vi) {
-            if (!g_Logged) g_Log.OVs = vi->SerialNumber;
+            if (!g_Logged) g_Log.OrigVolumeSerial = vi->SerialNumber;
             vi->SerialNumber = g_VS;
         }
     }
@@ -774,8 +755,8 @@ static VOID SpoofRegistry() {
     st = ZwOpenKey(&hk, KEY_SET_VALUE | KEY_QUERY_VALUE, &oa);
     if (NT_SUCCESS(st)) {
         if (!g_Logged) {
-            RegReadStr(hk, L"SystemSerialNumber", g_Log.OBs, 64);
-            RegReadStr(hk, L"BaseBoardSerialNumber", g_Log.OMs, 64);
+            RegReadStr(hk, L"SystemSerialNumber", g_Log.OrigBIOSSerial, 64);
+            RegReadStr(hk, L"BaseBoardSerialNumber", g_Log.OrigBoardSerial, 64);
         }
         RegReadStr(hk, L"BIOSVersion", g_OrigBV, 64);
         RegReadStr(hk, L"SystemProductName", g_OrigPN, 48);
@@ -792,7 +773,7 @@ static VOID SpoofRegistry() {
     st = ZwOpenKey(&hk, KEY_SET_VALUE | KEY_QUERY_VALUE, &oa);
     if (NT_SUCCESS(st)) {
         if (!g_Logged) {
-            RegReadStr(hk, L"HardwareInformation.AdapterString", g_Log.OGp, 64);
+            RegReadStr(hk, L"HardwareInformation.AdapterString", g_Log.OrigGPUId, 64);
         }
         RegSetStr(hk, L"HardwareInformation.AdapterString", g_GP);
         ZwClose(hk);
@@ -848,8 +829,8 @@ static VOID RevertRegistry() {
     InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
     if (NT_SUCCESS(st)) {
-        if (g_Log.OBs[0]) RegSetStr(hk, L"SystemSerialNumber", g_Log.OBs);
-        if (g_Log.OMs[0]) RegSetStr(hk, L"BaseBoardSerialNumber", g_Log.OMs);
+        if (g_Log.OrigBIOSSerial[0]) RegSetStr(hk, L"SystemSerialNumber", g_Log.OrigBIOSSerial);
+        if (g_Log.OrigBoardSerial[0]) RegSetStr(hk, L"BaseBoardSerialNumber", g_Log.OrigBoardSerial);
         if (g_OrigBV[0])  RegSetStr(hk, L"BIOSVersion", g_OrigBV);
         if (g_OrigPN[0])  RegSetStr(hk, L"SystemProductName", g_OrigPN);
         ZwClose(hk);
@@ -860,7 +841,7 @@ static VOID RevertRegistry() {
     InitializeObjectAttributes(&oa, &kp, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
     st = ZwOpenKey(&hk, KEY_SET_VALUE, &oa);
     if (NT_SUCCESS(st)) {
-        if (g_Log.OGp[0]) RegSetStr(hk, L"HardwareInformation.AdapterString", g_Log.OGp);
+        if (g_Log.OrigGPUId[0]) RegSetStr(hk, L"HardwareInformation.AdapterString", g_Log.OrigGPUId);
         ZwClose(hk);
     }
 }
@@ -888,7 +869,28 @@ static VOID RevertMACRegistry() {
 
 static VOID RevertThread(PVOID context) {
     UNREFERENCED_PARAMETER(context);
-    KeWaitForSingleObject(g_pRevertEvent, Executive, KernelMode, FALSE, NULL);
+
+    /*
+     * Loop: wait for revert signal with a 2-second timeout. On timeout
+     * republish the shared block so original IDs captured lazily by the
+     * hooks (SMBIOS BIOS serial, disk serial via IOCTL, MAC via NDIS,
+     * volume serial via FS) propagate to the manager UI. On signal,
+     * proceed to revert and exit.
+     */
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -(LONGLONG)(2 * 10000 * 1000); /* -2s (relative) */
+
+    for (;;) {
+        NTSTATUS wst = KeWaitForSingleObject(
+            g_pRevertEvent, Executive, KernelMode, FALSE, &timeout);
+        if (wst == STATUS_SUCCESS)
+            break; /* revert requested */
+        /* STATUS_TIMEOUT -> republish and keep waiting. */
+        HwidComm_Publish();
+    }
+
+    HwidComm_SetStatus(HWID_STATUS_REVERTING);
+    HwidComm_Publish();
 
     DispatchHookRemove(&g_hDisk);
     DispatchHookRemove(&g_hNdis);
@@ -897,6 +899,9 @@ static VOID RevertThread(PVOID context) {
 
     RevertRegistry();
     RevertMACRegistry();
+
+    HwidComm_SetStatus(HWID_STATUS_REVERTED);
+    HwidComm_Publish();
 
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
@@ -907,6 +912,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
     UNREFERENCED_PARAMETER(RegistryPath);
     UNREFERENCED_PARAMETER(DriverObject);
 
+    HwidComm_Init();
     GenAllIDs();
     SpoofRegistry();
     SpoofMACRegistry();
@@ -928,7 +934,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         ZwQuerySystemInformation(76, &probe, sizeof(probe), &needed);
         if (needed > 0 && needed < 0x100000) {
             FW_TABLE_INFO* fi =
-                (FW_TABLE_INFO*)ExAllocatePoolWithTag(NonPagedPool, needed, 'bmsR');
+                (FW_TABLE_INFO*)ExAllocatePool2(POOL_FLAG_NON_PAGED, needed, 'bmsR');
             if (fi) {
                 RtlZeroMemory(fi, needed);
                 fi->ProviderSignature = 'RSMB';
@@ -938,8 +944,8 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
                     fi->TableBufferLength < 0x100000) {
                     SpoofSMBIOS(fi->TableBuffer, fi->TableBufferLength);
                     g_SpoofedSMBIOSLen = fi->TableBufferLength;
-                    g_SpoofedSMBIOS = (PUCHAR)ExAllocatePoolWithTag(
-                        NonPagedPool, fi->TableBufferLength, 'bmsS');
+                    g_SpoofedSMBIOS = (PUCHAR)ExAllocatePool2(
+                        POOL_FLAG_NON_PAGED, fi->TableBufferLength, 'bmsS');
                     if (g_SpoofedSMBIOS) {
                         RtlCopyMemory(g_SpoofedSMBIOS, fi->TableBuffer,
                             fi->TableBufferLength);
@@ -957,30 +963,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         }
     }
 
-    WriteLog();
+    PublishLog();
 
-    {
-        UNICODE_STRING evtName;
-        RtlInitUnicodeString(&evtName, L"\\BaseNamedObjects\\HWIDSpooferRevert");
-        OBJECT_ATTRIBUTES evtOa;
-        InitializeObjectAttributes(&evtOa, &evtName, OBJ_CASE_INSENSITIVE, NULL, NULL);
-        HANDLE hEvt;
-        if (NT_SUCCESS(ZwCreateEvent(&hEvt, EVENT_ALL_ACCESS, &evtOa,
-                NotificationEvent, FALSE))) {
-            NTSTATUS refSt = ObReferenceObjectByHandle(hEvt, EVENT_ALL_ACCESS,
-                *ExEventObjectType, KernelMode, (PVOID*)&g_pRevertEvent, NULL);
-            ZwClose(hEvt);
-
-            if (NT_SUCCESS(refSt) && g_pRevertEvent) {
-                KeClearEvent(g_pRevertEvent);
-
-                HANDLE hThread = NULL;
-                NTSTATUS thrSt = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
-                    NULL, NULL, NULL, RevertThread, NULL);
-                if (NT_SUCCESS(thrSt) && hThread)
-                    ZwClose(hThread);
-            }
-        }
+    if (NT_SUCCESS(HwidComm_CreateRevertEvent(&g_pRevertEvent)) && g_pRevertEvent) {
+        HANDLE hThread = NULL;
+        NTSTATUS thrSt = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
+            NULL, NULL, NULL, RevertThread, NULL);
+        if (NT_SUCCESS(thrSt) && hThread)
+            ZwClose(hThread);
     }
 
     return STATUS_SUCCESS;

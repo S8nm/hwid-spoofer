@@ -75,6 +75,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="manager.c" />
+    <ClCompile Include="hwid_comm.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="hwid_comm.h" />
+    <ClInclude Include="..\shared\hwid_protocol.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="manager.rc" />

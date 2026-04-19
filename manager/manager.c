@@ -23,6 +23,8 @@
 #include <commctrl.h>
 
 #include "resource.h"
+#include "../shared/hwid_protocol.h"
+#include "hwid_comm.h"
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -66,6 +68,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #define IDC_BTN_REFRESH      1004
 #define IDT_DURATION_TIMER   2001
 #define IDT_COUNTDOWN_TIMER  2002
+#define IDT_REFRESH_TIMER    2003
 
 // ==================== DURATION OPTIONS ====================
 
@@ -107,34 +110,15 @@ static CHAR g_CurrGPUID[256] = "(unknown)";
 static CHAR g_StatusText[256] = "INACTIVE";
 static COLORREF g_StatusColor = CLR_RED;
 
-// Extended ID tracking (from driver log)
-#pragma pack(push, 1)
-typedef struct {
-    CHAR Magic[8];
-    CHAR OrigDiskSerial[64];
-    CHAR FakeDiskSerial[64];
-    CHAR OrigBIOSSerial[64];
-    CHAR FakeBIOSSerial[64];
-    CHAR OrigBoardSerial[64];
-    CHAR FakeBoardSerial[64];
-    CHAR OrigSystemUUID[48];
-    CHAR FakeSystemUUID[48];
-    UCHAR OrigMAC[6];
-    UCHAR FakeMAC[6];
-    ULONG OrigVolumeSerial[1];
-    ULONG FakeVolumeSerial[1];
-    CHAR OrigGPUId[64];
-    CHAR FakeGPUId[64];
-    CHAR OrigModelNumber[48];
-    CHAR FakeModelNumber[48];
-    CHAR OrigFirmwareRev[16];
-    CHAR FakeFirmwareRev[16];
-    CHAR OrigSmbBoardSerial[64]; /* SMBIOS Type 2 original (driver OSmbMb); registry board is OrigBoardSerial */
-} HWID_LOG;
-#pragma pack(pop)
-
-static HWID_LOG g_HwidLog = {0};
-static BOOL g_LogLoaded = FALSE;
+/*
+ * Extended ID tracking: struct layout is now owned by shared/hwid_protocol.h
+ * (HWID_ID_LOG) and delivered via the DriverComm wrapper. The g_HwidLog /
+ * g_LogLoaded globals below are thin compatibility shims over g_DriverComm
+ * so the rest of the UI code keeps working with minimal churn.
+ */
+static HWID_DRIVER_COMM g_DriverComm;
+#define g_HwidLog   (*HwidComm_GetLog(&g_DriverComm))
+#define g_LogLoaded (HwidComm_IsConnected(&g_DriverComm))
 
 static CHAR g_TempDir[MAX_PATH] = {0};
 static CHAR g_VulnDriverPath[MAX_PATH] = {0};
@@ -253,9 +237,7 @@ void GenerateRandomHexName(char* buffer, size_t len);
 BOOL LoadSpooferDriver();
 BOOL UnloadSpooferDriver();
 BOOL IsAdmin();
-BOOL ReadHwidLog();
 void SaveHwidLogToDocuments();
-static void SignalDriverRevert();
 
 static void DbgLog(const char* fmt, ...);
 
@@ -456,6 +438,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             DoRevertHWID();
             InvalidateRect(hWnd, NULL, TRUE);
         }
+        else if (wParam == IDT_REFRESH_TIMER) {
+            /* Pull a fresh shared block; driver republishes every 2s with
+             * originals filled in as hooks observe them. */
+            if (HwidComm_IsConnected(&g_DriverComm)) {
+                if (HwidComm_Refresh(&g_DriverComm))
+                    InvalidateRect(hWnd, NULL, FALSE);
+            } else {
+                KillTimer(hWnd, IDT_REFRESH_TIMER);
+            }
+        }
         else if (wParam == IDT_COUNTDOWN_TIMER) {
             if (g_SpooferLoaded && g_SpoofExpiry > 0) {
                 ULONGLONG now = GetTickCount64();
@@ -587,7 +579,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DrawTextLine(memDC, 34, y, "BIOS Serial:", g_HwidLog.FakeBIOSSerial, CLR_GREEN); y += 19;
                 DrawTextLine(memDC, 34, y, "Board Serial:", g_HwidLog.FakeBoardSerial, CLR_GREEN); y += 19;
                 DrawTextLine(memDC, 34, y, "System UUID:", g_HwidLog.FakeSystemUUID, CLR_GREEN); y += 19;
-                { char vb[32]; sprintf_s(vb, sizeof(vb), "%08X", g_HwidLog.FakeVolumeSerial[0]);
+                { char vb[32]; sprintf_s(vb, sizeof(vb), "%08X", g_HwidLog.FakeVolumeSerial);
                   DrawTextLine(memDC, 34, y, "Volume Serial:", vb, CLR_GREEN); } y += 19;
                 DrawTextLine(memDC, 34, y, "GPU ID:", g_HwidLog.FakeGPUId, CLR_GREEN);
             } else {
@@ -739,7 +731,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hWnd, IDT_DURATION_TIMER);
         KillTimer(hWnd, IDT_COUNTDOWN_TIMER);
         if (g_SpooferLoaded) {
-            SignalDriverRevert();
+            HwidComm_RequestRevert(&g_DriverComm);
+            HwidComm_WaitForRevert(&g_DriverComm, 3000);
             UnloadSpooferDriver();
         }
         CleanupTempFiles();
@@ -1138,24 +1131,13 @@ void RefreshCurrentHWIDs() {
         strcpy_s(g_CurrGPUID, sizeof(g_CurrGPUID), "(not available)");
 }
 
-// ==================== HWID LOG ====================
+// ==================== HWID LOG (delegated to DriverComm) ====================
 
-BOOL ReadHwidLog() {
-    // Driver writes log to C:\hwid_log.bin
-    HANDLE hFile = CreateFileA("C:\\ProgramData\\hwid_log.bin", GENERIC_READ, FILE_SHARE_READ,
-        NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
-
-    DWORD bytesRead = 0;
-    ReadFile(hFile, &g_HwidLog, sizeof(HWID_LOG), &bytesRead, NULL);
-    CloseHandle(hFile);
-
-    if (bytesRead == sizeof(HWID_LOG) && memcmp(g_HwidLog.Magic, "HWIDLOG", 7) == 0) {
-        g_LogLoaded = TRUE;
-        return TRUE;
-    }
-    return FALSE;
-}
+/*
+ * Legacy ReadHwidLog() replaced by HwidComm_Init() which performs a full
+ * handshake (magic + version + size). The wrapper exposes the validated log
+ * via HwidComm_GetLog(); callers use g_HwidLog alias above.
+ */
 
 void SaveHwidLogToDocuments() {
     if (!g_LogLoaded) return;
@@ -1205,8 +1187,8 @@ void SaveHwidLogToDocuments() {
         g_HwidLog.FakeMAC[3], g_HwidLog.FakeMAC[4], g_HwidLog.FakeMAC[5]);
 
     fprintf(f, "--- VOLUME ---\n");
-    fprintf(f, "  Original Serial:   %08X\n", g_HwidLog.OrigVolumeSerial[0]);
-    fprintf(f, "  Spoofed Serial:    %08X\n\n", g_HwidLog.FakeVolumeSerial[0]);
+    fprintf(f, "  Original Serial:   %08X\n", g_HwidLog.OrigVolumeSerial);
+    fprintf(f, "  Spoofed Serial:    %08X\n\n", g_HwidLog.FakeVolumeSerial);
 
     fprintf(f, "--- GPU ---\n");
     fprintf(f, "  Original ID:       %s\n", g_HwidLog.OrigGPUId);
@@ -1218,20 +1200,12 @@ void SaveHwidLogToDocuments() {
 
     fclose(f);
 
-    // Also delete the binary log from C:\ (cleanup)
-    DeleteFileA("C:\\ProgramData\\hwid_log.bin");
+    /* Binary shared block cleanup is handled by HwidComm_Shutdown. */
 }
 
 // ==================== SPOOF / REVERT ====================
 
-static void SignalDriverRevert() {
-    HANDLE hEvt = OpenEventA(EVENT_MODIFY_STATE, FALSE, "Global\\HWIDSpooferRevert");
-    if (hEvt) {
-        SetEvent(hEvt);
-        CloseHandle(hEvt);
-        Sleep(200);
-    }
-}
+/* SignalDriverRevert replaced by HwidComm_RequestRevert(&g_DriverComm). */
 
 void UpdateStatus() {
     if (g_SpooferLoaded) {
@@ -1246,9 +1220,12 @@ void UpdateStatus() {
 
 void DoSpoofHWID() {
     if (g_SpooferLoaded) {
-        SignalDriverRevert();
+        HwidComm_RequestRevert(&g_DriverComm);
+        HwidComm_WaitForRevert(&g_DriverComm, 3000);
         UnloadSpooferDriver();
+        HwidComm_Shutdown(&g_DriverComm);
         g_SpooferLoaded = FALSE;
+        KillTimer(g_hWnd, IDT_REFRESH_TIMER);
         Sleep(300);
     }
 
@@ -1294,22 +1271,43 @@ void DoSpoofHWID() {
     RefreshCurrentHWIDs();
     UpdateStatus();
 
-    // Read driver's ID log and save human-readable version to Documents
-    Sleep(500);
-    if (ReadHwidLog()) {
+    /*
+     * Handshake with the newly-loaded driver via DriverComm (magic + version
+     * + size check, fail-fast on mismatch). Up to 3s wait; driver normally
+     * publishes within a few hundred ms of DriverEntry.
+     */
+    HwidComm_Create(&g_DriverComm, DbgLog);
+    if (HwidComm_Init(&g_DriverComm, 3000)) {
         SaveHwidLogToDocuments();
+        /*
+         * Driver republishes the shared block every 2s (see RevertThread
+         * in HelloWorld.c). Poll it from the UI so Orig* values captured
+         * lazily by hooks (BIOS SMBIOS serial, disk serial via first
+         * IOCTL, MAC via first NDIS query, volume serial on first FS
+         * query) appear in the panel without user interaction.
+         */
+        SetTimer(g_hWnd, IDT_REFRESH_TIMER, 2500, NULL);
+    } else {
+        DbgLog("DoSpoofHWID: DriverComm handshake FAILED - "
+               "driver may not have published shared block");
     }
 }
 
 void DoRevertHWID() {
     if (!g_SpooferLoaded) return;
 
-    SignalDriverRevert();
+    HwidComm_RequestRevert(&g_DriverComm);
+    /* Block until driver confirms HWID_STATUS_REVERTED (hooks removed,
+     * registry restored) before unloading - otherwise we race the driver
+     * and risk leaving hooks/regvals in place. 3s is enough: revert work
+     * is synchronous inside RevertThread. */
+    HwidComm_WaitForRevert(&g_DriverComm, 3000);
     UnloadSpooferDriver();
+    HwidComm_Shutdown(&g_DriverComm);
     g_SpooferLoaded = FALSE;
-    g_LogLoaded = FALSE;
     g_SpoofExpiry = 0;
     KillTimer(g_hWnd, IDT_DURATION_TIMER);
+    KillTimer(g_hWnd, IDT_REFRESH_TIMER);
 
     CleanupTempFiles();
     CreateHiddenTempDirectory();
