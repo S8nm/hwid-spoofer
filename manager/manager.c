@@ -125,7 +125,7 @@ static CHAR g_VulnDriverPath[MAX_PATH] = {0};
 static CHAR g_VulnServiceName[32] = {0};
 static CHAR g_VulnDeviceName[64] = {0};
 
-static char g_LastMapFail[512];
+static char g_LastMapFail[768];
 
 static void SetLastMapFailV(const char* fmt, ...) {
     va_list ap;
@@ -135,14 +135,6 @@ static void SetLastMapFailV(const char* fmt, ...) {
 }
 
 static void ClearLastMapFail(void) { g_LastMapFail[0] = 0; }
-
-static BOOL KM_AllowUnsafeKernelVaProbe(void) {
-    char v[8] = {0};
-    DWORD n = GetEnvironmentVariableA("HWID_ALLOW_UNSAFE_KVA_PTE_SCAN", v, (DWORD)sizeof(v));
-    if (n == 0 || n >= sizeof(v))
-        return FALSE;
-    return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
-}
 
 // ==================== KDMAPPER STRUCTURES ====================
 
@@ -1423,6 +1415,181 @@ void CleanupTempFiles() {
     RemoveDirectoryA(g_TempDir);
 }
 
+// ==================== PRE-FLIGHT / NALFIX ====================
+
+/*
+ * Return the file name portion of a path (no directory).
+ * Returns pointer into the same buffer; never NULL.
+ */
+static const char* PathBaseNameA(const char* p) {
+    const char* b = p;
+    const char* s = p;
+    for (; *s; ++s) {
+        if (*s == '\\' || *s == '/') b = s + 1;
+    }
+    return b;
+}
+
+/*
+ * NalFix: iterate all SERVICE_KERNEL_DRIVER services and stop+delete any
+ * whose ImagePath filename matches iqvw64e.sys. This clears leftover
+ * instances from crashed previous runs / other mappers that would
+ * otherwise own \Device\Nal and cause our own load to silently
+ * misbehave. Inspired by VollRagm/NalFix.
+ *
+ * Skips the service this run is about to install (nameToSkip) so we
+ * don't remove the service we're in the middle of creating.
+ */
+static void NalFix_PurgeExistingIqvw64e(SC_HANDLE scm, const char* nameToSkip) {
+    DWORD bytesNeeded = 0, servicesReturned = 0, resumeHandle = 0;
+
+    /* Probe size. */
+    EnumServicesStatusExA(scm, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
+        SERVICE_STATE_ALL, NULL, 0, &bytesNeeded, &servicesReturned,
+        &resumeHandle, NULL);
+    if (bytesNeeded == 0) return;
+
+    BYTE* buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, bytesNeeded);
+    if (!buf) return;
+
+    DWORD bufSize = bytesNeeded;
+    if (!EnumServicesStatusExA(scm, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
+            SERVICE_STATE_ALL, buf, bufSize, &bytesNeeded,
+            &servicesReturned, &resumeHandle, NULL)) {
+        DbgLog("NalFix: EnumServicesStatusEx failed (err=%lu)", GetLastError());
+        HeapFree(GetProcessHeap(), 0, buf);
+        return;
+    }
+
+    ENUM_SERVICE_STATUS_PROCESSA* services =
+        (ENUM_SERVICE_STATUS_PROCESSA*)buf;
+
+    int purged = 0;
+    for (DWORD i = 0; i < servicesReturned; ++i) {
+        const char* svcName = services[i].lpServiceName;
+        if (!svcName) continue;
+        if (nameToSkip && _stricmp(svcName, nameToSkip) == 0) continue;
+
+        SC_HANDLE svc = OpenServiceA(scm, svcName,
+            SERVICE_QUERY_CONFIG | SERVICE_STOP | DELETE);
+        if (!svc) continue;
+
+        BYTE cfgBuf[4096];
+        DWORD cfgNeeded = 0;
+        if (QueryServiceConfigA(svc, (LPQUERY_SERVICE_CONFIGA)cfgBuf,
+                sizeof(cfgBuf), &cfgNeeded)) {
+            LPQUERY_SERVICE_CONFIGA cfg = (LPQUERY_SERVICE_CONFIGA)cfgBuf;
+            if (cfg->lpBinaryPathName) {
+                const char* imgName = PathBaseNameA(cfg->lpBinaryPathName);
+                if (_stricmp(imgName, "iqvw64e.sys") == 0) {
+                    SERVICE_STATUS ss;
+                    ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+                    BOOL del = DeleteService(svc);
+                    DbgLog("NalFix: purged stale iqvw64e service '%s' "
+                           "(stop ok, delete=%s)",
+                           svcName, del ? "OK" : "FAIL");
+                    purged++;
+                }
+            }
+        }
+        CloseServiceHandle(svc);
+    }
+
+    HeapFree(GetProcessHeap(), 0, buf);
+    if (purged == 0)
+        DbgLog("NalFix: no stale iqvw64e services found");
+}
+
+/*
+ * Pre-flight checks. Returns TRUE if environment looks OK.
+ * On FALSE, SetLastMapFailV has been called with a targeted message
+ * surfaced by the "Driver Error - Pre-flight" MessageBox (not Stage 4).
+ */
+static BOOL PreFlight_Check(const char* driverPath) {
+    /* 1. Path must be ASCII-only and contain no spaces. The KDMapper-style
+     *    flow calls service APIs with this path; unicode/space breakage is
+     *    a classic "driver fails to load for no obvious reason" footgun. */
+    for (const char* p = driverPath; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (c > 0x7F) {
+            DbgLog("PreFlight FAIL: non-ASCII byte 0x%02X in driver path '%s'",
+                c, driverPath);
+            SetLastMapFailV(
+                "Driver path contains non-ASCII characters. Move your user "
+                "profile / TEMP directory to an ASCII-only path (no accents, "
+                "CJK, etc.) and retry.\nPath: %s", driverPath);
+            return FALSE;
+        }
+    }
+
+    /* 2. HVCI / Memory Integrity check. If enabled, the Nal exploit and
+     *    kernel-VA PTE flip are architecturally blocked on Win11 24H2+. */
+    {
+        HKEY hk = NULL;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios"
+                "\\HypervisorEnforcedCodeIntegrity",
+                0, KEY_READ, &hk) == ERROR_SUCCESS) {
+            DWORD enabled = 0, sz = sizeof(enabled);
+            if (RegQueryValueExA(hk, "Enabled", NULL, NULL,
+                    (LPBYTE)&enabled, &sz) == ERROR_SUCCESS && enabled != 0) {
+                DbgLog("PreFlight: HVCI registry Enabled=%lu "
+                       "(Memory Integrity is ON)", enabled);
+                SetLastMapFailV(
+                    "Memory Integrity (HVCI) is enabled. Disable it in "
+                    "Windows Security -> Device security -> Core isolation, "
+                    "reboot, then retry. See README 'Setup Guide'.");
+                RegCloseKey(hk);
+                return FALSE;
+            }
+            RegCloseKey(hk);
+        }
+    }
+
+    /* 3. Anti-cheat driver check. If vgk/BEDaisy/EasyAntiCheat is already
+     *    loaded, kernel writes will typically be observed/blocked long
+     *    before we finish mapping. Warn loudly rather than silently fail. */
+    {
+        static const char* ac_services[] = {
+            "vgk",              /* Riot Vanguard kernel driver */
+            "vgc",              /* Riot Vanguard user service */
+            "BEDaisy",          /* BattlEye kernel driver */
+            "EasyAntiCheat",    /* EAC user service */
+            "ESEADriver2",      /* ESEA */
+            NULL
+        };
+        SC_HANDLE scm = OpenSCManagerA(NULL, NULL,
+            SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+        if (scm) {
+            for (int i = 0; ac_services[i]; ++i) {
+                SC_HANDLE svc = OpenServiceA(scm, ac_services[i],
+                    SERVICE_QUERY_STATUS);
+                if (!svc) continue;
+                SERVICE_STATUS st = {0};
+                if (QueryServiceStatus(svc, &st) &&
+                        st.dwCurrentState != SERVICE_STOPPED) {
+                    DbgLog("PreFlight: anti-cheat '%s' is running "
+                        "(state=%lu) - mapping will likely be blocked",
+                        ac_services[i], st.dwCurrentState);
+                    SetLastMapFailV(
+                        "Anti-cheat service '%s' is running. Vanguard/BE/EAC "
+                        "load at boot and block kernel mappers. Close the "
+                        "game launcher completely (Task Manager -> End Task) "
+                        "and reboot before spoofing.",
+                        ac_services[i]);
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(scm);
+                    return FALSE;
+                }
+                CloseServiceHandle(svc);
+            }
+            CloseServiceHandle(scm);
+        }
+    }
+
+    return TRUE;
+}
+
 // ==================== INTEGRATED KDMAPPER ====================
 
 BOOL LoadVulnerableDriver() {
@@ -1447,6 +1614,10 @@ BOOL LoadVulnerableDriver() {
         DbgLog("LoadVulnDriver FAIL: OpenSCManager (err=%lu)", GetLastError());
         return FALSE;
     }
+
+    /* NalFix: clear any stale iqvw64e services before creating our own,
+     * so \Device\Nal is free for our DriverEntry to create. */
+    NalFix_PurgeExistingIqvw64e(scm, g_VulnServiceName);
 
     SC_HANDLE svc = CreateServiceA(scm, g_VulnServiceName, g_VulnServiceName,
         SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
@@ -2090,23 +2261,68 @@ BOOL KM_WriteToReadOnlyMemory(ULONG64 kernelAddr, PVOID buffer, SIZE_T size) {
         }
     }
 
-    if (!KM_AllowUnsafeKernelVaProbe()) {
-        DbgLog("  WriteToReadOnly: kernel-VA PTE scan disabled (unsafe with case 0x33 on unmapped slots)");
-        SetLastMapFailV(
-            "Kernel write path aborted: physical PTE walk unavailable, user-mode PTE_BASE scan failed, "
-            "and kernel-VA probe scan is disabled to prevent BSOD on this build. "
-            "Set HWID_ALLOW_UNSAFE_KVA_PTE_SCAN=1 only for diagnostic testing.");
-        return FALSE;
-    }
-
-    DbgLog("  WriteToReadOnly: UNSAFE kernel-VA PTE scan explicitly enabled by environment");
+    /*
+     * IMPORTANT: do NOT auto-run KM_FindPteBaseForSystem here.
+     *
+     * An earlier revision of this file tried to fall through to a PML4
+     * candidate-index scan automatically on Win11 24H2+ (build 26100+).
+     * Issue #6 (majlis1qatar-eng, Apr 2026) reproduced an immediate BSOD
+     * exactly at the "trying PML4 candidate-index scan" log line.
+     *
+     * Why it BSODs on 24H2:
+     *   - KM_FindPteBaseForSystem iterates PML4 indices 256..511 and reads
+     *     a computed PTE slot for each via Nal case 0x33.
+     *   - Nal case 0x33 uses MmCopyMemory(MM_COPY_MEMORY_VIRTUAL), which
+     *     handles PTE/PDE-level faults (__try/__except catches them) but
+     *     does NOT survive when the PML4 entry itself is non-present --
+     *     the hardware walk fails at the top level before the software
+     *     fault handler is reachable, and on 24H2 HVCI/KDP this surfaces
+     *     as IRQL_NOT_LESS_OR_EQUAL / KERNEL_SECURITY_CHECK_FAILURE.
+     *
+     * Consequence: on Win11 24H2 with the current kdmapper primitives,
+     * we simply cannot discover the KASLR'd PTE_BASE safely. Users see
+     * the honest error below. A real fix requires either:
+     *   (a) a different vulnerable driver that exposes an arbitrary-read
+     *       with __try/__except at PML4 level, or
+     *   (b) deriving PTE_BASE from disassembling nt!MiGetPteAddress in
+     *       the running kernel image without guessing.
+     *
+     * The env-var HWID_ALLOW_UNSAFE_KVA_PTE_SCAN=1 is retained so we can
+     * re-enable the scan on developer machines for research, but it will
+     * stay OFF for shipped builds.
+     */
     {
-        ULONG64 pteBase = KM_FindPteBaseForSystem();
-        if (!pteBase) {
-            DbgLog("  WriteToReadOnly FAIL: could not locate PTE_BASE (kernel VA scan)");
+        char v[8] = {0};
+        DWORD n = GetEnvironmentVariableA(
+            "HWID_ALLOW_UNSAFE_KVA_PTE_SCAN", v, (DWORD)sizeof(v));
+        BOOL allow = (n > 0 && n < sizeof(v) &&
+            (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' ||
+             v[0] == 't' || v[0] == 'T'));
+        if (!allow) {
+            DbgLog("  WriteToReadOnly: PML4 candidate-index scan disabled "
+                "(BSODs on Win11 24H2 per GitHub issue #6). Set "
+                "HWID_ALLOW_UNSAFE_KVA_PTE_SCAN=1 only on a lab machine.");
+            SetLastMapFailV(
+                "Kernel write path aborted. On Windows 11 24H2+ with HVCI / "
+                "VBS / KDP, the iqvw64e mapper cannot complete: Intel Nal "
+                "MapPhys is restricted and we do not auto-run the "
+                "candidate-index PTE_BASE scan (it bugchecks on PML4-not-present "
+                "faults — see ISSUES.md section 6 and issue #6). Disable Memory "
+                "Integrity, VBS, and the hypervisor (README Setup Guide), "
+                "reboot, and retry; or use a different vulnerable driver "
+                "(roadmap).");
             return FALSE;
         }
-        DbgLog("  WriteToReadOnly: using PTE_BASE=0x%llX (kernel VA flip)", pteBase);
+        DbgLog("  WriteToReadOnly: UNSAFE PML4 scan explicitly enabled "
+            "via HWID_ALLOW_UNSAFE_KVA_PTE_SCAN");
+        ULONG64 pteBase = KM_FindPteBaseForSystem();
+        if (!pteBase) {
+            DbgLog("  WriteToReadOnly FAIL: PML4 scan found no match");
+            SetLastMapFailV(
+                "Unsafe PML4 scan enabled but found no PTE_BASE candidate.");
+            return FALSE;
+        }
+        DbgLog("  WriteToReadOnly: using PTE_BASE=0x%llX (candidate-index scan)", pteBase);
         if (KM_TryKernelVaWritableFlip(pteBase, kernelAddr, buffer, size))
             return TRUE;
     }
@@ -2606,6 +2822,21 @@ BOOL LoadSpooferDriver() {
         }
     }
 
+    DbgLog("STAGE 0: Pre-flight environment checks...");
+    if (!PreFlight_Check(g_VulnDriverPath)) {
+        DbgLog("STAGE 0 FAIL: pre-flight rejected environment");
+        char msg[768];
+        sprintf_s(msg, sizeof(msg),
+            "Pre-flight check failed.\n\n%s\n\n"
+            "Full log: hwid_debug.log next to Manager.exe",
+            g_LastMapFail[0] ? g_LastMapFail
+                             : "No detail available (see log).");
+        MessageBoxA(g_hWnd, msg,
+            "Driver Error - Pre-flight", MB_ICONERROR);
+        return FALSE;
+    }
+    DbgLog("STAGE 0 PASSED: pre-flight OK");
+
     DbgLog("STAGE 1: Loading vulnerable driver...");
     if (!LoadVulnerableDriver()) {
         DWORD err = GetLastError();
@@ -2660,9 +2891,13 @@ BOOL LoadSpooferDriver() {
     if (!KM_MapDriverFromMemory(resData, resSize)) {
         DbgLog("STAGE 4 FAIL: KM_MapDriverFromMemory returned FALSE");
         {
-            char msg[768];
+            char msg[1536];
             sprintf_s(msg, sizeof(msg),
-                "Stage 4 failed: kernel mapping did not complete.\n\n%s\n\n"
+                "Stage 4 failed: kernel mapping did not complete.\n\n"
+                "Windows 11 24H2 (build 26100+): there is no silent fallback "
+                "that magically finds PTE_BASE — unsafe scans are opt-in only "
+                "(ISSUES.md). With HVCI/VBS on, the iqvw64e path is blocked.\n\n"
+                "%s\n\n"
                 "Full step log: hwid_debug.log next to Manager.exe",
                 g_LastMapFail[0] ? g_LastMapFail
                     : "No detail (see log for steps 1/3/5/7).");

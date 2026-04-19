@@ -28,6 +28,7 @@ Randomizes every hardware fingerprint that modern anti-cheat systems read, in un
 - [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
 - [Disclaimer](#disclaimer)
+- [Engineering log (`ISSUES.md`)](ISSUES.md)
 
 ---
 
@@ -218,7 +219,7 @@ manager\build\Release\Manager\Manager.exe    (~220KB, self-contained)
 
 This single file is everything you need. No DLLs, no config files, no runtime dependencies.
 
-**GitHub releases** ship **only `Manager.exe`** (one download). It is self-contained; separate `HelloWorld.sys` / `KDMapper.exe` zips are not required for normal use.
+**GitHub releases** usually ship a **zip** (`Manager.exe`, `KDMapper.exe`, `HelloWorld.sys`) or a standalone **`Manager.exe`** — check the release page. The manager remains self-contained when distributed as EXE-only.
 
 ### Visual Studio Build
 
@@ -483,17 +484,57 @@ The manager shows which stage failed. Use this table:
 | **"Stage 3 failed"** | Resource load | Spoofer driver resource missing from EXE | Rebuild from source; the EXE may be corrupted |
 | **"Stage 4 failed"** | Kernel mapping | Pool allocation, import resolution, or DriverEntry failed | Verify VBS is off; check for AV interference |
 
+### Stage 0 — Pre-flight Errors
+
+The manager runs an environment check before it tries to map anything. If the check fails you get a dialog titled **"Driver Error - Pre-flight"**. These are genuine blockers that no code change will work around:
+
+| Pre-flight message | Meaning | Fix |
+|---|---|---|
+| **"Memory Integrity (HVCI) is enabled"** | HVCI is on; kernel pages are hardware-read-only | Windows Security → Device security → Core isolation → turn **Memory integrity** OFF → reboot |
+| **"Driver path contains non-ASCII characters"** | Your user profile / `%TEMP%` path has accents, CJK, emoji, etc. | Create a new Windows user with an ASCII username, or move `%TEMP%` to `C:\Temp`, then retry |
+| **"Anti-cheat service 'vgk' / 'BEDaisy' / 'EasyAntiCheat' is running"** | A game's kernel anti-cheat is already resident and will observe/block the mapper | End the game launcher in Task Manager, **reboot**, and run the spoofer **before** launching the game |
+
 ### Other Issues
 
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | **"A driver cannot load on this device"** (Windows popup) | Vulnerable Driver Blocklist is enabled | Run: `reg add "HKLM\SYSTEM\CurrentControlSet\Control\CI\Config" /v VulnerableDriverBlocklistEnable /t REG_DWORD /d 0 /f` then reboot |
 | **"Failed to extract embedded driver files"** | AV quarantined the EXE or blocked extraction | Add exclusion for `Manager.exe` and `%TEMP%` |
-| **"Failed to open device"** | `iqvw64e.sys` loaded but device not created | Another instance may be running; reboot and retry |
+| **"Failed to open device"** / **`\Device\Nal` already in use** | Another `iqvw64e`-based mapper left a stale service | **Auto-handled:** the manager now runs NalFix on every load — it enumerates all `SERVICE_KERNEL_DRIVER` services, finds any whose image is `iqvw64e.sys`, and stops+deletes them before creating its own. If a third-party service still holds the device, reboot once. |
+| **KDMapper log: "Can't find pattern"** (external KDMapper only) | The kdmapper version predates your Windows build, or Windows is newer than kdmapper supports | Rebuild the latest [TheCruZ/kdmapper](https://github.com/TheCruZ/kdmapper) or update Windows. The integrated mapper in this repo uses a different pattern path and does not emit this error. |
+| **MSB8020** (build error) | WDK is not fully installed or the platform toolset version is missing | Install the matching Windows Driver Kit from [learn.microsoft.com/.../download-the-wdk](https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk); reopen the solution after install. |
+| **MSB4062** (build error, task cannot be loaded) | Corrupt SDK/MSBuild cache or mismatch between VS and WDK versions | Run Visual Studio Installer → **Modify** → repair. Ensure SDK + WDK are the **same build number** (e.g. both 10.0.26100.0). |
 | **IDs not changing after spoof** | WMI / Win32 cache not refreshed | Run **cmd as Administrator**: `net stop winmgmt` then `net start winmgmt` (restarts WMI; some tools cache until then). Also close and reopen any app that displays HWIDs |
 | **Log file empty or missing** | Driver couldn't write to `C:\ProgramData` | Run as admin; check folder permissions |
 | **Some IDs revert immediately** | Application re-reads from firmware, not OS cache | Expected for firmware-level queries |
 | **BIOS/Board serial shows "(not available)"** | System firmware doesn't populate those fields | Normal on some hardware; values appear after spoofing |
+
+### Anti-cheat / Mapping Order
+
+Kernel anti-cheats (Vanguard `vgk.sys`, BattlEye `BEDaisy.sys`, Easy Anti-Cheat, FACEIT AC) load during Windows boot or as soon as their launcher process starts. **Once loaded, they observe every subsequent kernel map and will flag the session.** The correct order is:
+
+1. Reboot with no game launcher running.
+2. Confirm pre-flight passes (no `vgk` / `BEDaisy` / `EasyAntiCheat` service in `Running` state).
+3. Spoof.
+4. Start the game.
+
+If step 2 fails, Task Manager → End Task on every launcher process (Riot Client, Steam, FACEIT client, BEService etc.), then reboot. Some launchers auto-restart the kernel driver on next boot; disabling their startup entry in Task Manager → Startup apps suppresses that until you want to play.
+
+### Windows 11 24H2 (build 26100+) specific
+
+24H2 randomizes `PTE_BASE` per boot and adds stricter kernel-memory protections (`MmMapIoSpace` filtering, HVCI/KDP). The manager **first** runs the **kernel-image scan** for `MiGetPteAddress` / `PTE_BASE` with **consecutive-PFN validation**. There is **no production “auto-fallback”** that silently runs a **PML4 candidate-index scan** — that path **bugchecked** real users (GitHub [#6](https://github.com/S8nm/hwid-spoofer/issues/6)). Full postmortem: **[`ISSUES.md` section 6](ISSUES.md)**.
+
+When the safe scan cannot produce a valid `PTE_BASE` and the unsafe scan is **not** enabled, mapping stops. The **Stage 4** dialog and `hwid_debug.log` show an explicit message: the **iqvw64e** mapper **cannot proceed** on that OS configuration until HVCI/VBS/hypervisor restrictions are relaxed **or** a different exploit driver is integrated.
+
+**Research-only opt-in:** `HWID_ALLOW_UNSAFE_KVA_PTE_SCAN=1` re-enables the PML4 walk **only** if you explicitly set the environment variable — expect **BSOD risk** on 24H2+ hardened systems. **Do not use on daily-driver machines.**
+
+**Your options (production):**
+
+- **Disable Memory Integrity, VBS, and the hypervisor** (`bcdedit /set hypervisorlaunchtype off` — see [Setup Guide](#setup-guide)), reboot, and retry so the image-anchor path can succeed.
+- **Different vulnerable driver** (see [Roadmap](#roadmap)) — required for many “HVCI on” lab scenarios.
+- **EFI bootkit loader** (out of scope for this repo).
+
+**Why we do not promise an automatic PTE discovery scan:** proving safety requires **multi-build, multi-SKU** evidence and local HVCI repros — not induction from a single log line that “passed until PML4.”
 
 ### WMI cache (`winmgmt`)
 
