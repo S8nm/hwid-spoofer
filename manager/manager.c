@@ -630,8 +630,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         TextOutA(memDC, 290, 712, "Duration:", 9);
 
         RECT rcChange = {20, 730, 265, 765};
-        DrawButton(memDC, &rcChange, "Install Bootkit",
-                   CLR_BTN_CHANGE, g_HoverChange);
+        if (BootkitGetStatus() == BOOTKIT_STATUS_INSTALLED_ACTIVE) {
+            DrawButton(memDC, &rcChange, g_SpooferLoaded ? "Randomize Again" : "Spoof HWID",
+                       CLR_BTN_CHANGE, g_HoverChange);
+        } else {
+            DrawButton(memDC, &rcChange, "Install Bootkit",
+                       CLR_BTN_CHANGE, g_HoverChange);
+        }
 
         RECT rcRevert = {20, 775, 265, 808};
         DrawButton(memDC, &rcRevert, "Revert to Original", CLR_BTN_REVERT, g_HoverRevert);
@@ -664,7 +669,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int my = HIWORD(lParam);
 
         if (mx >= 20 && mx <= 265 && my >= 730 && my <= 765) {
-            DoInstallBootkit();
+            if (BootkitGetStatus() == BOOTKIT_STATUS_INSTALLED_ACTIVE) {
+                DoSpoofHWID();
+            } else {
+                DoInstallBootkit();
+            }
             InvalidateRect(hWnd, NULL, TRUE);
         }
         else if (mx >= 20 && mx <= 265 && my >= 775 && my <= 808) {
@@ -1258,15 +1267,7 @@ void DoSpoofHWID() {
         Sleep(300);
     }
 
-    if (GetFileAttributesA(g_VulnDriverPath) == INVALID_FILE_ATTRIBUTES) {
-        if (!ExtractDriverFiles()) {
-            MessageBoxA(g_hWnd,
-                "Failed to extract embedded driver files.",
-                "Extract Error", MB_ICONERROR);
-            UpdateStatus();
-            return;
-        }
-    }
+
 
     if (!LoadSpooferDriver()) {
         UpdateStatus();
@@ -2842,134 +2843,73 @@ BOOL KM_MapDriverFromMemory(PVOID fileBuffer, DWORD fileSize) {
 // ==================== DRIVER MANAGEMENT ====================
 
 BOOL LoadSpooferDriver() {
-    DbgInit();
-    DbgLog("========================================");
-    DbgLog("=== HWID Spoofer Diagnostic Log ===");
-    DbgLog("========================================");
-    {
-        RTL_OSVERSIONINFOW os = {0};
-        os.dwOSVersionInfoSize = sizeof(os);
-        pRtlGetVersion pRv = (pRtlGetVersion)GetProcAddress(
-            GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
-        if (pRv && pRv(&os) >= 0) {
-            DbgLog("Windows: %lu.%lu build %lu", os.dwMajorVersion, os.dwMinorVersion,
-                os.dwBuildNumber);
-        } else {
-            DbgLog("Windows: RtlGetVersion unavailable or failed");
+    DbgLog("STAGE 1: Loading spoofer driver natively via SCM (DSE Disabled)");
+    
+    char tempPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    strcat_s(tempPath, MAX_PATH, "spoofer.sys");
+    
+    if (!ExtractResource(IDR_SPOOFER_SYS, tempPath)) {
+        MessageBoxA(g_hWnd, "Failed to extract spoofer.sys", "Error", MB_ICONERROR);
+        return FALSE;
+    }
+    
+    SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    if (!hSCManager) return FALSE;
+
+    SC_HANDLE hService = CreateServiceA(
+        hSCManager, "HwidSpoofer", "HWID Spoofer Driver",
+        SERVICE_START | DELETE | SERVICE_STOP,
+        SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE,
+        tempPath, NULL, NULL, NULL, NULL, NULL);
+
+    if (!hService) {
+        if (GetLastError() == ERROR_SERVICE_EXISTS) {
+            hService = OpenServiceA(hSCManager, "HwidSpoofer", SERVICE_START | DELETE | SERVICE_STOP);
+        }
+        if (!hService) {
+            CloseServiceHandle(hSCManager);
+            return FALSE;
         }
     }
 
-    DbgLog("STAGE 0: Pre-flight environment checks...");
-    if (!PreFlight_Check(g_VulnDriverPath)) {
-        DbgLog("STAGE 0 FAIL: pre-flight rejected environment");
-        char msg[768];
-        sprintf_s(msg, sizeof(msg),
-            "Pre-flight check failed.\n\n%s\n\n"
-            "Full log: hwid_debug.log next to Manager.exe",
-            g_LastMapFail[0] ? g_LastMapFail
-                             : "No detail available (see log).");
-        MessageBoxA(g_hWnd, msg,
-            "Driver Error - Pre-flight", MB_ICONERROR);
-        return FALSE;
-    }
-    DbgLog("STAGE 0 PASSED: pre-flight OK");
-
-    DbgLog("STAGE 1: Loading vulnerable driver...");
-    if (!LoadVulnerableDriver()) {
+    BOOL started = StartServiceA(hService, 0, NULL);
+    if (!started && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
         DWORD err = GetLastError();
-        DbgLog("STAGE 1 FAIL: err=%lu", err);
-        char msg[512];
-        sprintf_s(msg, sizeof(msg),
-            "Stage 1 failed: vulnerable driver won't load.\n"
-            "Error code: %lu\n\n"
-            "- Disable Memory Integrity in Windows Security\n"
-            "- Disable Vulnerable Driver Blocklist (registry)\n"
-            "- Reboot after changing settings\n\n"
-            "Debug log: same folder as Manager.exe", err);
-        MessageBoxA(g_hWnd, msg, "Driver Error - Stage 1", MB_ICONERROR);
-        return FALSE;
-    }
-    DbgLog("STAGE 1 PASSED: vulnerable driver loaded");
-
-    DbgLog("STAGE 2: Getting kernel base...");
-    g_KernelBase = KM_GetKernelBase();
-    if (!g_KernelBase) {
-        DbgLog("STAGE 2 FAIL: KM_GetKernelBase returned NULL");
-        MessageBoxA(g_hWnd, "Stage 2 failed: cannot locate kernel base address.",
-            "Driver Error - Stage 2", MB_ICONERROR);
-        UnloadVulnerableDriver();
-        return FALSE;
-    }
-    DbgLog("STAGE 2 PASSED: KernelBase=0x%llX", (ULONG64)g_KernelBase);
-
-    DbgLog("STAGE 3: Loading spoofer driver resource...");
-    HRSRC hRes = FindResourceA(g_hInst, MAKEINTRESOURCEA(IDR_SPOOFER_SYS), RT_RCDATA);
-    if (!hRes) {
-        DbgLog("STAGE 3 FAIL: FindResourceA returned NULL");
-        MessageBoxA(g_hWnd, "Stage 3 failed: spoofer driver resource not found in EXE.",
-            "Driver Error - Stage 3", MB_ICONERROR);
-        UnloadVulnerableDriver();
+        char msg[256];
+        sprintf_s(msg, sizeof(msg), "Failed to start driver service (Error %lu).\n\nPlease ensure your PC actually booted from the EFI Bootkit.", err);
+        MessageBoxA(g_hWnd, msg, "StartService Failed", MB_ICONERROR);
+        DeleteService(hService);
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
         return FALSE;
     }
 
-    HGLOBAL hData = LoadResource(g_hInst, hRes);
-    DWORD resSize = SizeofResource(g_hInst, hRes);
-    PVOID resData = hData ? LockResource(hData) : NULL;
-    if (!resData || resSize == 0) {
-        DbgLog("STAGE 3 FAIL: resource data NULL or size 0");
-        MessageBoxA(g_hWnd, "Stage 3 failed: cannot read spoofer driver resource.",
-            "Driver Error - Stage 3", MB_ICONERROR);
-        UnloadVulnerableDriver();
-        return FALSE;
-    }
-    DbgLog("STAGE 3 PASSED: resource size=%lu bytes", resSize);
-
-    DbgLog("STAGE 4: Mapping spoofer driver into kernel...");
-    if (!KM_MapDriverFromMemory(resData, resSize)) {
-        DbgLog("STAGE 4 FAIL: KM_MapDriverFromMemory returned FALSE");
-        {
-            char msg[1536];
-            sprintf_s(msg, sizeof(msg),
-                "Stage 4 failed: kernel mapping did not complete.\n\n"
-                "Windows 11 24H2 (build 26100+): there is no silent fallback "
-                "that magically finds PTE_BASE — unsafe scans are opt-in only "
-                "(ISSUES.md). With HVCI/VBS on, the iqvw64e path is blocked.\n\n"
-                "%s\n\n"
-                "Full step log: hwid_debug.log next to Manager.exe",
-                g_LastMapFail[0] ? g_LastMapFail
-                    : "No detail (see log for steps 1/3/5/7).");
-            MessageBoxA(g_hWnd, msg, "Driver Error - Stage 4", MB_ICONERROR);
-        }
-        UnloadVulnerableDriver();
-        return FALSE;
-    }
-
-    UnloadVulnerableDriver();
-    RemoveDirectoryA(g_TempDir);
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
     return TRUE;
 }
 
 BOOL UnloadSpooferDriver() {
-    UnloadVulnerableDriver();
-
     SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!scm) return FALSE;
 
-    // Use randomized service name + fallback known names
+    SC_HANDLE service = OpenServiceA(scm, "HwidSpoofer", SERVICE_ALL_ACCESS);
     BOOL success = FALSE;
-    const char* serviceNames[] = { g_VulnServiceName, "HWIDSpoofer" };
-    for (int i = 0; i < 2; i++) {
-        if (serviceNames[i][0] == '\0') continue;
-        SC_HANDLE service = OpenServiceA(scm, serviceNames[i], SERVICE_ALL_ACCESS);
-        if (service) {
-            SERVICE_STATUS status;
-            ControlService(service, SERVICE_CONTROL_STOP, &status);
-            DeleteService(service);
-            CloseServiceHandle(service);
-            success = TRUE;
-        }
+    if (service) {
+        SERVICE_STATUS status;
+        ControlService(service, SERVICE_CONTROL_STOP, &status);
+        DeleteService(service);
+        CloseServiceHandle(service);
+        success = TRUE;
     }
     CloseServiceHandle(scm);
+
+    char tempPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    strcat_s(tempPath, MAX_PATH, "spoofer.sys");
+    DeleteFileA(tempPath);
+
     return success;
 }
 
