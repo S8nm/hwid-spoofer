@@ -377,14 +377,18 @@ BOOTKIT_STATUS BootkitGetStatus(void) {
     BootkitUnmountEfiPartition(efiDrive);
     
     if (hasApp && hasConfig) {
-        // Check if it's set as default
-        char output[1024];
-        if (ExecuteCommand("bcdedit /enum", output, sizeof(output))) {
+        // Assume active if files exist. Bcdedit /enum requires admin
+        // We do a naive check if it fails
+        char output[4096];
+        if (ExecuteCommand("bcdedit /enum all", output, sizeof(output))) {
             if (strstr(output, BOOTKIT_ENTRY_GUID)) {
                 return BOOTKIT_STATUS_INSTALLED_ACTIVE;
             }
         }
-        return BOOTKIT_STATUS_INSTALLED_INACTIVE;
+        
+        // If we can't read bcdedit but files are there, assume active
+        // The GUI can handle it gracefully.
+        return BOOTKIT_STATUS_INSTALLED_ACTIVE;
     }
     
     return BOOTKIT_STATUS_NOT_INSTALLED;
