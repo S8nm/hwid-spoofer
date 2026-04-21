@@ -25,6 +25,7 @@
 #include "resource.h"
 #include "../shared/hwid_protocol.h"
 #include "hwid_comm.h"
+#include "../bootkit/efi_bootkit.h"
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -217,6 +218,8 @@ BOOL GetSystemUUID(char* buffer, size_t bufferSize);
 BOOL GetVolumeSerialNum(ULONG* serial);
 BOOL GetGPUID(char* buffer, size_t bufferSize);
 void DoSpoofHWID();
+void DoRevertHWID();
+void DoInstallBootkit();
 void DoRevertHWID();
 void UpdateStatus();
 void RefreshCurrentHWIDs();
@@ -627,7 +630,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         TextOutA(memDC, 290, 712, "Duration:", 9);
 
         RECT rcChange = {20, 730, 265, 765};
-        DrawButton(memDC, &rcChange, g_SpooferLoaded ? "Randomize Again" : "Change HWID",
+        DrawButton(memDC, &rcChange, "Install Bootkit",
                    CLR_BTN_CHANGE, g_HoverChange);
 
         RECT rcRevert = {20, 775, 265, 808};
@@ -661,7 +664,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int my = HIWORD(lParam);
 
         if (mx >= 20 && mx <= 265 && my >= 730 && my <= 765) {
-            DoSpoofHWID();
+            DoInstallBootkit();
             InvalidateRect(hWnd, NULL, TRUE);
         }
         else if (mx >= 20 && mx <= 265 && my >= 775 && my <= 808) {
@@ -1207,6 +1210,40 @@ void UpdateStatus() {
         strcpy_s(g_StatusText, sizeof(g_StatusText), "INACTIVE");
         g_StatusColor = CLR_RED;
         g_TimeRemaining[0] = '\0';
+    }
+}
+
+void DoInstallBootkit() {
+    HRSRC hRes = FindResourceA(g_hInst, MAKEINTRESOURCEA(IDR_SPOOFER_SYS), RT_RCDATA);
+    if (!hRes) {
+        MessageBoxA(g_hWnd, "Failed to find driver resource.", "Error", MB_ICONERROR);
+        return;
+    }
+
+    HGLOBAL hData = LoadResource(g_hInst, hRes);
+    DWORD size = SizeofResource(g_hInst, hRes);
+    PVOID data = LockResource(hData);
+    
+    if (!data || size == 0) {
+        MessageBoxA(g_hWnd, "Failed to load driver resource.", "Error", MB_ICONERROR);
+        return;
+    }
+
+    BOOTKIT_CONFIG config = {0};
+    config.Magic = EFI_BOOTKIT_MAGIC;
+    config.Version = EFI_BOOTKIT_VERSION;
+    config.Flags = BOOTKIT_FLAG_CHAINLOAD_WIN;
+    config.DriverImage = (BYTE*)data;
+    config.DriverSize = size;
+    
+    BOOTKIT_RESULT result = BootkitInstall(&config);
+    if (result == BOOTKIT_SUCCESS) {
+        MessageBoxA(g_hWnd, "EFI Bootkit installed successfully!\n\nYour system will now boot through the EFI loader, which will bypass Driver Signature Enforcement and inject the spoofer driver automatically.\n\nPlease restart your PC.", "Bootkit Installed", MB_ICONINFORMATION);
+    } else {
+        const char* errStr = BootkitGetErrorString(result);
+        char msg[256];
+        sprintf_s(msg, sizeof(msg), "Failed to install EFI Bootkit: %s\n\nEnsure you are running as Administrator and your system is UEFI-based.", errStr);
+        MessageBoxA(g_hWnd, msg, "Installation Failed", MB_ICONERROR);
     }
 }
 

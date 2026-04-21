@@ -26,6 +26,25 @@
 extern "C" {
 #endif
 
+/* ---- PTE hook comm protocol (mirrors driver/pte_comm.h) ---- */
+
+#define PTE_COMM_MAGIC  0x44524B4Eu  /* "DRKN" */
+
+typedef enum _PTE_COMM_CMD {
+    PTE_CMD_PING         = 0x01,
+    PTE_CMD_GET_LOG      = 0x02,
+    PTE_CMD_GET_STATUS   = 0x03,
+    PTE_CMD_REVERT       = 0x04,
+} PTE_COMM_CMD;
+
+typedef struct _PTE_COMM_REQUEST {
+    unsigned int    magic;
+    unsigned int    command;
+    unsigned int    status_out;
+    unsigned int    reserved;
+    HWID_SHARED_BLOCK block_out;
+} PTE_COMM_REQUEST;
+
 /* Log sink installed by the manager (DbgLog in manager.c). NULL = silent. */
 typedef void (*HwidCommLogFn)(const char* fmt, ...);
 
@@ -33,8 +52,10 @@ typedef void (*HwidCommLogFn)(const char* fmt, ...);
 typedef struct _HWID_DRIVER_COMM {
     HWID_SHARED_BLOCK cached;       /* last successfully read block */
     BOOL              connected;    /* handshake succeeded */
+    BOOL              usePteComm;   /* TRUE if PTE hook channel is active */
     DWORD             lastError;    /* Win32 error from last failed op */
     HwidCommLogFn     logFn;        /* telemetry sink, may be NULL */
+    FARPROC           pteFunc;      /* NtQueryCompositionSurfaceStatistics */
 } HWID_DRIVER_COMM;
 
 /* Initialise comm, install optional log sink. Call once at startup. */

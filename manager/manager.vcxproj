@@ -76,10 +76,12 @@
   <ItemGroup>
     <ClCompile Include="manager.c" />
     <ClCompile Include="hwid_comm.c" />
+    <ClCompile Include="..\bootkit\efi_bootkit.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="hwid_comm.h" />
     <ClInclude Include="..\shared\hwid_protocol.h" />
+    <ClInclude Include="..\bootkit\efi_bootkit.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="manager.rc" />

@@ -16,6 +16,10 @@
 
 #include "hwid_comm.h"
 #include "../shared/hwid_protocol.h"
+#include "cleaner.h"
+#include "spoof_call.h"
+PKEVENT g_pRevertEvent = NULL;
+#include "pte_comm.h"
 
 extern POBJECT_TYPE *IoDriverObjectType;
 extern NTSTATUS NTAPI ObReferenceObjectByName(
@@ -23,9 +27,12 @@ extern NTSTATUS NTAPI ObReferenceObjectByName(
     ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode,
     PVOID ParseContext, PVOID *Object);
 
+#ifndef _ZWQUERYSYSTEMINFORMATION_DECLARED
+#define _ZWQUERYSYSTEMINFORMATION_DECLARED
 NTSYSCALLAPI NTSTATUS NTAPI ZwQuerySystemInformation(
     ULONG SystemInformationClass, PVOID SystemInformation,
     ULONG SystemInformationLength, PULONG ReturnLength);
+#endif
 
 NTSYSCALLAPI NTSTATUS NTAPI ZwCreateEvent(
     PHANDLE EventHandle, ACCESS_MASK DesiredAccess,
@@ -149,7 +156,6 @@ static IH g_hSysInfo = {0};
 
 static PUCHAR g_SpoofedSMBIOS    = NULL;
 static ULONG  g_SpoofedSMBIOSLen = 0;
-static PKEVENT g_pRevertEvent    = NULL;
 
 static CHAR g_OrigBV[64] = {0};
 static CHAR g_OrigPN[48] = {0};
@@ -892,6 +898,9 @@ static VOID RevertThread(PVOID context) {
     HwidComm_SetStatus(HWID_STATUS_REVERTING);
     HwidComm_Publish();
 
+    /* Remove PTE hook first so usermode comm stops */
+    PteComm_Remove();
+
     DispatchHookRemove(&g_hDisk);
     DispatchHookRemove(&g_hNdis);
     DispatchHookRemove(&g_hFs);
@@ -910,8 +919,25 @@ static VOID RevertThread(PVOID context) {
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     UNREFERENCED_PARAMETER(RegistryPath);
-    UNREFERENCED_PARAMETER(DriverObject);
+    UNREFERENCED_PARAMETER(DriverObject); /* invalid from kdmapper (0x2) */
 
+    /* ---- Phase 0: Kernel info for stealth modules ---- */
+    PVOID kernelBase = NULL;
+    ULONG kernelSize = 0;
+    __try {
+        Cleaner_GetKernelInfo(&kernelBase, &kernelSize);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        kernelBase = NULL;
+        kernelSize = 0;
+    }
+
+    /* Init return-address spoofing (optional - continues even if unavailable) */
+    if (kernelBase) {
+        __try { SpoofCall_Init(kernelBase); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { /* non-fatal */ }
+    }
+
+    /* ---- Phase 1: HWID spoofing (core functionality) ---- */
     HwidComm_Init();
     GenAllIDs();
     SpoofRegistry();
@@ -965,6 +991,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 
     PublishLog();
 
+    /* ---- Phase 2: Revert event + background thread ---- */
+    /* Must be created BEFORE PTE hook so PteComm_HookHandler can
+     * safely signal g_pRevertEvent on a PTE_CMD_REVERT request. */
     if (NT_SUCCESS(HwidComm_CreateRevertEvent(&g_pRevertEvent)) && g_pRevertEvent) {
         HANDLE hThread = NULL;
         NTSTATUS thrSt = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS,
@@ -972,6 +1001,20 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
         if (NT_SUCCESS(thrSt) && hThread)
             ZwClose(hThread);
     }
+
+    /* ---- Phase 3: Stealth communication via PTE hook ---- */
+    if (kernelBase) {
+        __try { PteComm_Install(kernelBase); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { /* non-fatal */ }
+    }
+
+    /* ---- Phase 4: Clean all traces (MUST be last) ---- */
+    /* NOTE: kdmapper invokes DriverEntry via HalDispatchTable[1], so the
+     * DriverObject parameter is actually ProfileSource (0x2), NOT a valid
+     * pointer. Pass NULL so Cleaner_HideDriverObject safely no-ops.
+     * For a manually-mapped driver there is no real DriverObject to hide. */
+    __try { CleanAllTraces(NULL); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { /* non-fatal */ }
 
     return STATUS_SUCCESS;
 }
