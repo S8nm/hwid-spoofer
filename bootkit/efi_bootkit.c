@@ -127,19 +127,6 @@ BOOL BootkitIsSecureBootEnabled(void) {
 
 // Mount EFI partition
 BOOL BootkitMountEfiPartition(char driveLetter[4]) {
-    char output[1024];
-    
-    // Use mountvol to get EFI partition path
-    if (!ExecuteCommand("mountvol", output, sizeof(output))) {
-        return FALSE;
-    }
-    
-    // Find EFI system partition (ESP) in output
-    // Format: \\?\Volume{GUID}
-    char* espStart = strstr(output, "*** NO MOUNT POINTS ***");
-    if (!espStart) {
-        return FALSE;
-    }
     
     // Find a free drive letter (try S: first)
     const char* tryLetters = "STUVWXYZ";
